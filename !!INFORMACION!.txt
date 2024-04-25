@@ -1,0 +1,34 @@
+-Me sale un error al iniciar ¿Como lo soluciono?
+Es posible que no te inicie por varios de estos motivos:
+
+*Que los drivers de tu tarjeta grafica no esten actualizados y no puedan abrir el juego. Prueba ejecutar el modo "OpenGL"
+*Que tu antivirus este bloqueando la ejecucion del juego y haya eliminado algunos archivos necesarios para abrirlos. Si es asi intenta deshabilitarlo y descomprimir el juego de nuevo
+*Que tu sistema operativo sea tan viejo que no soporte el juego, como Windows 2000 o XP
+*Que el archivo este corrupto y los datos estan dañados. Porfavor intenta descomprimirlo utilizando la ultima version de 7-Zip y descargalo usando Free Download Manager
+*Que el archivo se encuentre en muchas carpetas con nombres largos. Prueba mover la carpeta al escritorio
+*Que el script .BAT hecho por mi no funcione bien en tu PC y de errores (muy raro que pase) si es asi intenta editarlo utilizando ChatGPT para intentar solucionar el problema
+*Que no tengas las dependencias necesarias para ejecutar juegos instaladas, descargalas aqui: https://www.mediafire.com/file/2bjxzf59duumsr5/
+
+-¿Por que mi antivirus detecta el juego como Virus?
+Por que el ejecutable del juego esta modificado y su firma digital se invalida. Esto es un falso positivo
+
+Aunque en algunos juegos, puede ser detectado por algunos crack que se utilizan, simplemente desactiva tu antivirus 
+ya que es un falso positivo porque engaña al juego para jugarlo de manera gratuita
+
+-¿Que modificaciones re realizan en los juegos?
+Principalmente, se eliminan archivos inutiles y se comprimen multiples texturas/audios para reducir el peso del juego
+Tambien, se aplican configuraciones optimas para aumentar mas el rendimiento
+
+-¿Puedo subir el juego a mi sitio web/canal de youtube/etc?
+Si, siempre y cuando dejes creditos a su creador OptiJuegos y no pongas ningun tipo de acortador para generar ingresos
+
+-¿El juego funciona en 32 bits?
+Sí, funciona en 32 y 64 bits. La única excepción es GTA V y Pizza Tower, que solo funcionan en 64 bits.
+
+-¿Que significa "NORMAL" y "OPTIMIZACION"? ¿Como inicio el juego?
+Muy facil, el "1- (juego) NORMAL.bat" inicia el juego sin aplicar optimizaciones a windows
+el "2- (juego) OPTIMIZACION.bat" inicia el juego aplicando optimizaciones a windowws para obtener mejor desempeño.
+
+Puedes iniciar el juego ejecutando el ".bat" que gustes
+
+OptiJuegos - 2024
