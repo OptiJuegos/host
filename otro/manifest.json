@@ -1,0 +1,23 @@
+{
+   "background": {
+      "persistent": true,
+      "scripts": [ "event.js" ]
+   },
+   "browser_action": {
+      "default_icon": "icon128.png",
+      "default_title": "Reproductor HLS & DASH"
+   },
+   "content_security_policy": "script-src 'self' 'unsafe-eval'; object-src 'self'",
+   "description": "Reproductor M3U8/MPD nativo, reproducir Url HLS y DASH en tu navegador",
+   "icons": {
+      "128": "icon128.png"
+   },
+   "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEAokSu9lBUeowEPh1W+L8t2+2eHhOjMUWKyfISMyVblpWnqrO69MYHhXKYQiaWjE130fl9rQV51nYI1qzX1sl20XuPzB6yOlsL1bEPq0i/HjiNd8yBd5DLZ7TcXnl7ckEY/bKZB9r2LMobx89DEiBFHpOt3OsIzVzplIFjFv70hEhPZCieSzsky/s8Lpy3DOzbgBq6kjmfUSriQYx7oL4C8RQSrSDH2jswvoaxCBU/qEs4vnky9jsLsUYj1BApjec8SSVHTJNc9MmN+CiGWN1DfV6DCNIkGzkNsyW4feXDFy2mEe2V372MFi6OsBLHFcvzkb7xzBDrxXl0YkInWbblVQIDAQAB",
+   "manifest_version": 2,
+   "minimum_chrome_version": "23",
+   "name": "Reproductor M3U8 - HLS + DASH Player",
+   "permissions": [ "*://*/*.m3u8*", "*://*/*.mpd*", "webRequest", "webRequestBlocking" ],
+   "update_url": "https://clients2.google.com/service/update2/crx",
+   "version": "1.5.0.2",
+   "web_accessible_resources": [ "player.html", "icon128.png" ]
+}
