@@ -3,7 +3,7 @@
     Author         : Chris Titus @christitustech
     Runspace Author: @DeveloperDurp
     GitHub         : https://github.com/ChrisTitusTech
-    Version        : 26.10.09
+    Version        : 26.10.12
 #>
 
 param (
@@ -223,7 +223,7 @@ if (!([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]:
 
 # Variable to sync between runspaces
 $sync = [Hashtable]::Synchronized(@{})
-$sync.version = "26.10.09"
+$sync.version = "26.10.12"
 $sync.IsLocalCompile = "true" -eq "true"
 $sync.configs = @{}
 $sync.Buttons = [System.Collections.Generic.List[PSObject]]::new()
@@ -407,6 +407,32 @@ public static class WinUtilRunspacePoolCleanup
         -1,
         $true
     ) | Out-Null
+}
+
+function Convert-WinUtilTextEncoding {
+    param([AllowNull()][object]$Text)
+
+    # Windows PowerShell 5.1 reads UTF-8 scripts without a BOM as ANSI. This
+    # can corrupt string literals when a source file is dot-sourced directly.
+    # Only repair the typical UTF-8-as-Windows-1252 markers in UI strings.
+    if ($Text -isnot [string] -or [string]::IsNullOrEmpty($Text)) { return $Text }
+    if ($Text.IndexOf([char]0x00C3) -lt 0 -and
+        $Text.IndexOf([char]0x00C2) -lt 0 -and
+        $Text.IndexOf([char]0x00E2) -lt 0) {
+        return $Text
+    }
+
+    try {
+        $windows1252 = [Text.Encoding]::GetEncoding(1252, [Text.EncoderFallback]::ExceptionFallback, [Text.DecoderFallback]::ExceptionFallback)
+        $utf8 = [Text.UTF8Encoding]::new($false, $true)
+        $restored = $utf8.GetString($windows1252.GetBytes($Text))
+        if ($restored -ne $Text) { return $restored }
+    } catch [Text.EncoderFallbackException] {
+        # Normal Unicode outside code page 1252 is not mojibake.
+    } catch [Text.DecoderFallbackException] {
+        # An invalid UTF-8 sequence is evidence that the original text was fine.
+    }
+    return $Text
 }
 
 function Find-TweaksByNameOrDescription {
@@ -913,7 +939,7 @@ function Invoke-WinUtilPendingGroupChanges {
     foreach ($change in @($Changes)) {
         $key = [string]$change.Key
         $property = $sync.configs.tweaks.PSObject.Properties[$key]
-        if (-not $property -or $property.Value.ParentGroup -notin @('WPFServiceGroupDiagnostics', 'WPFDriverGroupOptional')) {
+        if (-not $property -or $property.Value.ParentGroup -notin @('WPFServiceGroupDiagnostics', 'WPFServiceGroupUseless', 'WPFDriverGroupOptional')) {
             throw "Invalid service/driver group selection '$key'."
         }
         $entry = $property.Value
@@ -922,13 +948,30 @@ function Invoke-WinUtilPendingGroupChanges {
         }
 
         $desired = [bool]$change.Disable
-        $actual = Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache -StopOnReadError
-        if ($actual -ne $desired) {
-            Invoke-WinUtilTweaks -CheckBox $key -undo (-not $desired)
-        }
-        $verified = Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache -StopOnReadError
-        if ($verified -ne $desired) {
-            throw "Could not verify the selected service/driver state for '$key'."
+        # One refused service must not abort the rest of the run. The failure is
+        # logged and counted, and its pending entry stays queued for retry.
+        try {
+            $actual = Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache -StopOnReadError
+            if ($actual -ne $desired) {
+                Invoke-WinUtilTweaks -CheckBox $key -undo (-not $desired)
+            }
+            $verified = Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache -StopOnReadError
+            if ($verified -ne $desired) {
+                # Set-WinUtilService only warns, so name the state Windows kept.
+                $detail = if ($entry.service) {
+                    $observed = @($entry.service | ForEach-Object {
+                        $service = Get-Service -Name $_.Name -ErrorAction SilentlyContinue
+                        $startType = if ($service) { [string]$service.StartType } else { 'missing' }
+                        $expected = if ($desired) { $_.StartupType } else { $_.OriginalType }
+                        "$($_.Name) startup is $startType (expected $expected)"
+                    }) -join '; '
+                    " $observed."
+                } else { '' }
+                throw "Could not verify the selected service/driver state for '$key'.$detail"
+            }
+        } catch {
+            Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Tweaks' -Context "Service/driver change $key"
+            continue
         }
         if ($null -ne $sync.ToggleStatusCache) {
             $sync.ToggleStatusCache[$key] = $verified
@@ -1996,6 +2039,947 @@ function Invoke-WinUtilFontScaling {
     }
 }
 
+function Get-WinUtilGuidedLanguage {
+    # The guided window is always in Spanish, whatever language the main
+    # window uses. guided.json keeps English as the fallback text.
+    return 'es'
+}
+
+function Get-WinUtilGuidedText {
+    param($Text)
+    if ($null -eq $Text) { return '' }
+    $language = Get-WinUtilGuidedLanguage
+    $value = if ($Text.PSObject.Properties[$language]) { $Text.$language } else { $Text.en }
+    return Convert-WinUtilTextEncoding -Text ([string]$value)
+}
+
+function Get-WinUtilGuidedList {
+    # Same as Get-WinUtilGuidedText, for { en: [...], es: [...] } lists.
+    param($List)
+    if ($null -eq $List) { return @() }
+    $language = Get-WinUtilGuidedLanguage
+    $values = if ($List.PSObject.Properties[$language]) { $List.$language } else { $List.en }
+    return @($values | ForEach-Object { Convert-WinUtilTextEncoding -Text ([string]$_) })
+}
+
+function Get-WinUtilGuidedQuestions {
+    return @($sync.configs.guided.Questions)
+}
+
+function Get-WinUtilGuidedGroupMembers {
+    # Only installed services: missing ones are hidden in the Tweaks tab too.
+    param([Parameter(Mandatory)][string]$GroupKey)
+    return @($sync.configs.tweaks.$GroupKey.Children | Where-Object {
+        $child = $sync.configs.tweaks.$_
+        $child.service -and (Get-Service -Name $child.service[0].Name -ErrorAction SilentlyContinue)
+    })
+}
+
+function Get-WinUtilGuidedPlan {
+    <#
+        .SYNOPSIS
+            Turns guided answers into the work Apply runs and the rows the summary shows
+    #>
+    param(
+        [hashtable]$Answers = @{},
+        [hashtable]$Options = @{}
+    )
+
+    $tweaks = [System.Collections.Generic.List[string]]::new()
+    $toggles = [System.Collections.Generic.List[object]]::new()
+    $groupChanges = [System.Collections.Generic.List[object]]::new()
+    $taskChanges = [System.Collections.Generic.List[object]]::new()
+    $items = [System.Collections.Generic.List[object]]::new()
+    $restorePoint = $false
+    $powerPlan = $false
+    $reboot = $false
+
+    $questions = @(Get-WinUtilGuidedQuestions)
+    for ($index = 0; $index -lt $questions.Count; $index++) {
+        $question = $questions[$index]
+        if (-not $Answers[$question.Id]) { continue }
+
+        # A question with options contributes one summary row per selected option.
+        $parts = @(if ($question.Options) {
+            $chosen = $Options[$question.Id]
+            $question.Options | Where-Object { $chosen -and $chosen[$_.Id] } | ForEach-Object {
+                [pscustomobject]@{ Label = Get-WinUtilGuidedText $_.Label; Actions = @($_.Actions) }
+            }
+        } else {
+            [pscustomobject]@{ Label = Get-WinUtilGuidedText $question.Summary; Actions = @($question.Actions) }
+        })
+
+        foreach ($part in $parts) {
+            foreach ($action in $part.Actions) {
+                $key = [string]$action.Key
+                $entry = $sync.configs.tweaks.$key
+                if ($null -eq $entry) { throw "Guided question '$($question.Id)' names unknown entry '$key'." }
+                if ($key -eq 'WPFTweaksRestorePoint') {
+                    $restorePoint = $true
+                } elseif ($entry.Type -eq 'Button') {
+                    # Buttons run code, not catalog entries; only this one is supported.
+                    if ($key -ne 'WPFAddUltPerf') { throw "Guided question '$($question.Id)' names button '$key', which guided mode cannot run." }
+                    $powerPlan = $true
+                } elseif ($entry.Type -eq 'ServiceGroup') {
+                    foreach ($member in @(Get-WinUtilGuidedGroupMembers -GroupKey $key)) {
+                        if (-not ($groupChanges | Where-Object { $_.Key -eq $member })) {
+                            $groupChanges.Add([pscustomobject]@{ Key = [string]$member; Disable = $true })
+                        }
+                    }
+                } elseif ($entry.Type -eq 'TaskGroup') {
+                    # Members narrows the group to telemetry tasks; the Apply job
+                    # skips tasks this PC does not have.
+                    $members = if ($action.Members) { @($action.Members) } else { @($entry.Children) }
+                    foreach ($member in $members) {
+                        if ($member -notin @($entry.Children)) { throw "Guided question '$($question.Id)' names '$member', which is not part of '$key'." }
+                        if (-not ($taskChanges | Where-Object { $_.Key -eq $member })) {
+                            $taskChanges.Add([pscustomobject]@{ Key = [string]$member; Disable = $true })
+                        }
+                    }
+                } elseif ($entry.Type -eq 'Toggle') {
+                    $toggles.Add([pscustomobject]@{ Key = $key; State = [bool]$action.State })
+                } elseif (-not $tweaks.Contains($key)) {
+                    $tweaks.Add($key)
+                }
+            }
+            $items.Add([pscustomobject]@{
+                Index = $index
+                Category = Get-WinUtilGuidedText $question.Category
+                Label = $part.Label
+                Advanced = ($question.Section -eq 'advanced')
+                Reversible = ($question.Reversible -ne $false)
+                Reboot = [bool]$question.Reboot
+            })
+        }
+        if ($question.Reboot -and $parts.Count -gt 0) { $reboot = $true }
+    }
+
+    return [pscustomobject]@{
+        RestorePoint = $restorePoint
+        PowerPlan = $powerPlan
+        Tweaks = @($tweaks)
+        Toggles = @($toggles)
+        GroupChanges = @($groupChanges)
+        TaskChanges = @($taskChanges)
+        Reboot = $reboot
+        Items = @($items)
+    }
+}
+
+function Get-WinUtilCpuMitigationAdvice {
+    <#
+        .SYNOPSIS
+            Estimates from the CPU model whether turning off Spectre/Meltdown mitigations pays off
+
+        .DESCRIPTION
+            Intel CPUs before the 9th generation need software mitigations for Meltdown and
+            Spectre v2, which cost the most. Intel 10th generation and later and AMD Zen 2 and
+            later fix most of this in hardware, so the gain is small. Name-based estimate only.
+    #>
+    param([string]$Name)
+    if (-not $Name) {
+        try { $Name = [string](Get-CimInstance -ClassName Win32_Processor -ErrorAction Stop | Select-Object -First 1).Name } catch { $Name = '' }
+    }
+    $Name = ($Name -replace '\s+', ' ').Trim()
+
+    $verdict = 'Unknown'
+    if ($Name -match 'Intel') {
+        if ($Name -match 'Core\(TM\) Ultra|Core Ultra') {
+            $verdict = 'Low'
+        } elseif ($Name -match '\bi[3579]-(\d{3,5})') {
+            # 4-digit models starting with 1 are 10th/11th/12th+ gen laptop chips (i7-1165G7).
+            $model = $Matches[1]
+            $generation = if ($model.Length -eq 3) { 1 } elseif ($model.StartsWith('1')) { [int]$model.Substring(0, 2) } else { [int]$model.Substring(0, 1) }
+            $verdict = if ($generation -le 8) { 'High' } elseif ($generation -eq 9) { 'Medium' } else { 'Low' }
+        } elseif ($Name -match 'Core\(TM\)2|Core 2') {
+            $verdict = 'High'
+        }
+    } elseif ($Name -match 'AMD') {
+        if ($Name -match 'Ryzen AI') {
+            $verdict = 'Low'
+        } elseif ($Name -match 'Ryzen.*?\b(\d)\d{3}([A-Z]*)') {
+            # Ryzen 1000/2000 and 3000 APUs (3400G) are Zen/Zen+.
+            $series = [int]$Matches[1]
+            $verdict = if ($series -le 2 -or ($series -eq 3 -and $Matches[2] -like 'G*')) { 'Medium' } else { 'Low' }
+        } elseif ($Name -match '\bFX\b|Athlon|Phenom|\bA\d+-\d') {
+            $verdict = 'Medium'
+        }
+    }
+
+    $text = switch ($verdict) {
+        'High' { @{ Title = 'Puede valer la pena en tu procesador'; Color = '#3FA34D'
+                Text = 'Es un Intel anterior a la 9.ª generación: depende de mitigaciones por software que pueden costar bastante rendimiento en juegos, disco y red.' } }
+        'Medium' { @{ Title = 'Ganancia pequeña en tu procesador'; Color = '#D4A017'
+                Text = 'Tu procesador tiene parte de estas protecciones en hardware. Pruébalo solo si buscas cada FPS y aceptas el riesgo.' } }
+        'Low' { @{ Title = 'No recomendado en tu procesador'; Color = '#E07B24'
+                Text = 'Tu procesador trae estas protecciones en hardware: la ganancia es mínima y pierdes seguridad.' } }
+        default { @{ Title = 'No se pudo identificar la generación de tu procesador'; Color = '#8A8A8A'
+                Text = 'La ganancia suele ser notable en Intel anteriores a la 9.ª generación y mínima en procesadores modernos.' } }
+    }
+    return [pscustomobject]@{
+        Name = $Name
+        Verdict = $verdict
+        Title = $text.Title
+        Text = $text.Text
+        Color = $text.Color
+    }
+}
+
+function Get-WinUtilPowerPlanAdvice {
+    <#
+        .SYNOPSIS
+            Says whether the Ultimate Performance plan suits this PC: desktop yes, laptop no
+
+        .DESCRIPTION
+            The chassis type decides. A battery only counts when the chassis is unknown,
+            because a USB UPS also shows up as a battery on desktops.
+    #>
+    param([int[]]$ChassisTypes, [object]$HasBattery = $null)
+    if (-not $PSBoundParameters.ContainsKey('ChassisTypes')) {
+        try { $ChassisTypes = @((Get-CimInstance -ClassName Win32_SystemEnclosure -ErrorAction Stop).ChassisTypes) } catch { $ChassisTypes = @() }
+    }
+    $portable = @(8, 9, 10, 11, 12, 14, 18, 21, 30, 31, 32)
+    $desktop = @(3, 4, 5, 6, 7, 13, 15, 16, 17, 23, 24, 35, 36)
+    $isLaptop = if (@($ChassisTypes | Where-Object { $_ -in $portable }).Count -gt 0) { $true }
+        elseif (@($ChassisTypes | Where-Object { $_ -in $desktop }).Count -gt 0) { $false }
+        else {
+            if ($null -eq $HasBattery) {
+                try { $HasBattery = @(Get-CimInstance -ClassName Win32_Battery -ErrorAction Stop).Count -gt 0 } catch { $HasBattery = $false }
+            }
+            [bool]$HasBattery
+        }
+
+    if ($isLaptop) {
+        return [pscustomobject]@{
+            Recommend = $false
+            Title = 'No recomendado en tu equipo (portátil)'
+            Text = 'Tu equipo es portátil: el plan sube el consumo y la temperatura y gasta más batería. Aunque la uses enchufada, la ganancia suele ser pequeña.'
+            Color = '#E07B24'
+        }
+    }
+    return [pscustomobject]@{
+        Recommend = $true
+        Title = 'Recomendado en tu equipo (PC de escritorio)'
+        Text = 'Tu equipo es de escritorio: no tienes batería que cuidar. Solo sube un poco el consumo en reposo.'
+        Color = '#3FA34D'
+    }
+}
+
+function Test-WinUtilGuidedQuestionApplied {
+    # True only when every action is a readable toggle or service group already
+    # in the answer's state. Script tweaks have no reliable state, so $null.
+    param([Parameter(Mandatory)]$Question)
+    if ($Question.Options -or -not $Question.Actions) { return $null }
+    foreach ($action in @($Question.Actions)) {
+        $entry = $sync.configs.tweaks.$($action.Key)
+        if ($entry.Type -eq 'ServiceGroup') {
+            foreach ($member in @(Get-WinUtilGuidedGroupMembers -GroupKey $action.Key)) {
+                if (-not (Get-WinUtilToggleStatus -ToggleSwitch $member)) { return $false }
+            }
+        } elseif ($entry.Type -eq 'Toggle' -and $null -ne $action.State) {
+            if ([bool](Get-WinUtilToggleStatus -ToggleSwitch $action.Key) -ne [bool]$action.State) { return $false }
+        } else {
+            return $null
+        }
+    }
+    return $true
+}
+
+function New-WinUtilGuidedBadge {
+    param([string]$Text, [string]$Color)
+    $brush = [Windows.Media.BrushConverter]::new().ConvertFromString($Color)
+    $badge = New-Object Windows.Controls.Border
+    $badge.BorderBrush = $brush
+    $badge.BorderThickness = '1.5'
+    $badge.CornerRadius = '10'
+    $badge.Padding = '10,3'
+    $badge.Margin = '0,0,8,6'
+    $label = New-Object Windows.Controls.TextBlock
+    $label.Text = $Text
+    $label.FontSize = 12
+    $label.FontWeight = 'Bold'
+    $label.Background = [Windows.Media.Brushes]::Transparent
+    $label.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'MainForegroundColor')
+    $badge.Child = $label
+    return $badge
+}
+
+function New-WinUtilGuidedWindow {
+    <#
+        .SYNOPSIS
+            Builds the separate guided-mode window from $guidedXML
+
+        .DESCRIPTION
+            A closed WPF window cannot be shown again, so every opening builds a new one. The
+            main window's resources are merged in, which gives it the same theme and styles.
+    #>
+    param([System.Windows.Window]$Owner)
+
+    [xml]$xaml = $guidedXML
+    $window = [Windows.Markup.XamlReader]::Load([System.Xml.XmlNodeReader]::new($xaml))
+    if ($sync.Form) { $window.Resources.MergedDictionaries.Add($sync.Form.Resources) }
+    $xaml.SelectNodes('//*[@Name]') | ForEach-Object { $sync[$_.Name] = $window.FindName($_.Name) }
+    $sync.GuidedWindow = $window
+    $sync.GuidedOpenAdvanced = $false
+    if ($Owner) {
+        $window.Owner = $Owner
+        $window.WindowStartupLocation = 'CenterOwner'
+    }
+    if ($sync.version) { $window.Title = "APBOptimizer $($sync.version)" }
+
+    # The main window wired its buttons before this one existed.
+    foreach ($node in $xaml.SelectNodes("//*[local-name()='Button'][@Name]")) {
+        $sync[$node.Name].Add_Click({ Invoke-WPFButton $this.Name })
+    }
+    $sync.WPFGuidedTitleBar.Add_MouseLeftButtonDown({ $sync.GuidedWindow.DragMove() })
+    $window.Add_Closing({
+        param($eventSender, $closingArgs)
+        $null = $eventSender
+        if ($sync.ActiveJob -eq 'Guided') {
+            $closingArgs.Cancel = $true
+            $message = if ((Get-WinUtilGuidedLanguage) -eq 'es') { 'Espera a que terminen de aplicarse los cambios.' } else { 'Wait until the changes finish applying.' }
+            Show-WinUtilMessage -Title 'APBOptimizer' -Message $message -Button 'OK' -Icon 'Information' | Out-Null
+        }
+    })
+    $window.Add_Closed({ $sync.GuidedPanel = $null })
+
+    try { $sync.GuidedLogoPanel.Children.Add((Invoke-WinUtilAssets -Type 'logo' -Size 25)) | Out-Null } catch {
+        Write-WinUtilLog -Level 'WARN' -Component 'Guided' -Message "Could not draw the guided window logo: $($_.Exception.Message)"
+    }
+    return $window
+}
+
+function Show-WinUtilGuidedWindow {
+    <#
+        .SYNOPSIS
+            Shows the guided window until it closes; returns $true when the user chose advanced mode
+    #>
+    param(
+        [ValidateSet('Chooser', 'Resume')][string]$Start = 'Chooser',
+        [System.Windows.Window]$Owner
+    )
+
+    $sync.GuidedReviewPlan = $null
+    $window = New-WinUtilGuidedWindow -Owner $Owner
+    switch ($Start) {
+        'Chooser' { Show-WinUtilModeChooser }
+        'Resume' {
+            # Reopening keeps an unfinished run's answers.
+            if ($sync.GuidedState -and -not $sync.GuidedState.Completed) {
+                Show-WinUtilGuidedQuestion -Index $sync.GuidedState.Index
+            } else {
+                Start-WinUtilGuided
+            }
+        }
+    }
+    $null = $window.ShowDialog()
+    $sync.GuidedWindow = $null
+    return [bool]$sync.GuidedOpenAdvanced
+}
+
+function Show-WinUtilGuidedPanel {
+    param([Parameter(Mandatory)][ValidateSet('Chooser', 'Wizard', 'Summary', 'Done')][string]$Panel)
+    $panels = @{ Chooser = 'WPFModeChooser'; Wizard = 'WPFGuidedWizard'; Summary = 'WPFGuidedSummary'; Done = 'WPFGuidedDone' }
+    foreach ($entry in $panels.GetEnumerator()) {
+        $sync[$entry.Value].Visibility = if ($entry.Key -eq $Panel) { 'Visible' } else { 'Collapsed' }
+    }
+    $sync.GuidedPanel = $Panel
+}
+
+function Show-WinUtilModeChooser {
+    Show-WinUtilGuidedPanel -Panel 'Chooser'
+}
+
+function Select-WinUtilMode {
+    param([Parameter(Mandatory)][ValidateSet('guided', 'advanced')][string]$Mode)
+    if ($Mode -eq 'guided') { Start-WinUtilGuided } else { Exit-WinUtilGuided }
+}
+
+function Start-WinUtilGuided {
+    $sync.GuidedState = @{ Index = 0; Answers = @{}; Options = @{}; ReturnToSummary = $false; Completed = $false }
+    Show-WinUtilGuidedQuestion -Index 0
+}
+
+function Exit-WinUtilGuided {
+    # Closing hands over to the full interface: Start-WinUtilUserInterface opens it,
+    # or it is already open underneath when guided mode came from its menu.
+    $sync.GuidedOpenAdvanced = $true
+    if ($sync.GuidedWindow) { $sync.GuidedWindow.Close() }
+}
+
+function Show-WinUtilGuidedQuestion {
+    param([int]$Index)
+
+    $questions = @(Get-WinUtilGuidedQuestions)
+    if ($Index -ge $questions.Count) {
+        Show-WinUtilGuidedSummary
+        return
+    }
+    if ($Index -lt 0) { $Index = 0 }
+    $sync.GuidedState.Index = $Index
+    $question = $questions[$Index]
+    $isSpanish = ((Get-WinUtilGuidedLanguage) -eq 'es')
+    $basicCount = @($questions | Where-Object { $_.Section -ne 'advanced' }).Count
+    $advancedCount = $questions.Count - $basicCount
+
+    $sync.WPFGuidedCategory.Text = Get-WinUtilGuidedText $question.Category
+    $sync.WPFGuidedStep.Text = if ($question.Section -eq 'advanced') {
+        $position = $Index - $basicCount + 1
+        if ($isSpanish) { "Avanzado $position de $advancedCount" } else { "Advanced $position of $advancedCount" }
+    } elseif ($isSpanish) { "Pregunta $($Index + 1) de $basicCount" } else { "Question $($Index + 1) of $basicCount" }
+    $sync.WPFGuidedProgress.Value = [math]::Round((($Index + 1) / $questions.Count) * 100)
+    $sync.WPFGuidedTitle.Text = Get-WinUtilGuidedText $question.Title
+    $sync.WPFGuidedBody.Text = Get-WinUtilGuidedText $question.Body
+    $sync.WPFGuidedDetailsList.Children.Clear()
+    $details = @(Get-WinUtilGuidedList $question.Details)
+    foreach ($detail in $details) {
+        $line = New-Object Windows.Controls.TextBlock
+        $line.Text = [string][char]0x2022 + '  ' + $detail
+        $line.FontSize = 14
+        $line.TextWrapping = 'Wrap'
+        $line.Margin = '4,0,0,4'
+        $line.Opacity = 0.9
+        $line.Background = [Windows.Media.Brushes]::Transparent
+        $line.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'MainForegroundColor')
+        $sync.WPFGuidedDetailsList.Children.Add($line) | Out-Null
+    }
+    $sync.WPFGuidedDetails.Visibility = if ($details.Count -gt 0) { 'Visible' } else { 'Collapsed' }
+    $note = Get-WinUtilGuidedText $question.Note
+    $sync.WPFGuidedNoteText.Text = $note
+    $sync.WPFGuidedNote.Visibility = if ($note) { 'Visible' } else { 'Collapsed' }
+
+    # Some answers depend on this PC: the advice box says why, and a desktop
+    # makes the power plan a recommended answer.
+    $advice = $null
+    if ($question.Advice -eq 'CPUMitigations') {
+        if (-not $sync.GuidedCpuAdvice) { $sync.GuidedCpuAdvice = Get-WinUtilCpuMitigationAdvice }
+        $cpu = $sync.GuidedCpuAdvice
+        $cpuName = if ($cpu.Name) { $cpu.Name } else { 'desconocido' }
+        $advice = [pscustomobject]@{ Title = "$($cpu.Title) ($cpuName)"; Text = "$($cpu.Text) Estimación según el modelo del procesador."; Color = $cpu.Color; Recommend = $false }
+    } elseif ($question.Advice -eq 'PowerPlan') {
+        if (-not $sync.GuidedPowerAdvice) { $sync.GuidedPowerAdvice = Get-WinUtilPowerPlanAdvice }
+        $advice = $sync.GuidedPowerAdvice
+    }
+    $recommended = [bool]$question.Recommended -or ($null -ne $advice -and [bool]$advice.Recommend)
+
+    $sync.WPFGuidedBadges.Children.Clear()
+    if ($question.Section -eq 'advanced') {
+        $sync.WPFGuidedBadges.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'Avanzado' } else { 'Advanced' }) -Color '#E07B24')) | Out-Null
+    } elseif ($recommended) {
+        $sync.WPFGuidedBadges.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'Recomendado' } else { 'Recommended' }) -Color '#2E77FF')) | Out-Null
+    }
+    if ($question.Reversible -eq $false) {
+        $sync.WPFGuidedBadges.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'No se puede deshacer' } else { 'Cannot be undone' }) -Color '#E07B24')) | Out-Null
+    } else {
+        $sync.WPFGuidedBadges.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'Se puede deshacer' } else { 'Can be undone' }) -Color '#3FA34D')) | Out-Null
+    }
+    if ($question.Reboot) {
+        $sync.WPFGuidedBadges.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'Requiere reiniciar' } else { 'Restart required' }) -Color '#D4A017')) | Out-Null
+    }
+
+    $sync.WPFGuidedAdvice.Visibility = 'Collapsed'
+    if ($advice) {
+        $sync.WPFGuidedAdviceTitle.Text = Convert-WinUtilTextEncoding -Text ([string]$advice.Title)
+        $sync.WPFGuidedAdviceText.Text = Convert-WinUtilTextEncoding -Text ([string]$advice.Text)
+        $sync.WPFGuidedAdvice.BorderBrush = [Windows.Media.BrushConverter]::new().ConvertFromString($advice.Color)
+        $sync.WPFGuidedAdvice.Visibility = 'Visible'
+    }
+
+    $applied = $null
+    try { $applied = Test-WinUtilGuidedQuestionApplied -Question $question } catch { $applied = $null }
+    $sync.WPFGuidedState.Text = if ($isSpanish) { 'Ya está así en tu PC.' } else { 'This PC is already set this way.' }
+    $sync.WPFGuidedState.Visibility = if ($applied -eq $true) { 'Visible' } else { 'Collapsed' }
+
+    $sync.WPFGuidedOptions.Children.Clear()
+    $sync.GuidedOptionBoxes = [System.Collections.Generic.List[object]]::new()
+    if ($question.Options) {
+        $saved = $sync.GuidedState.Options[$question.Id]
+        $asToggles = ($question.OptionStyle -eq 'Toggle')
+        foreach ($option in @($question.Options)) {
+            $box = New-Object Windows.Controls.CheckBox
+            $box.Tag = [string]$option.Id
+            $box.IsChecked = if ($saved -and $saved.ContainsKey([string]$option.Id)) { [bool]$saved[[string]$option.Id] } else { [bool]$option.Default }
+            $content = New-Object Windows.Controls.StackPanel
+            foreach ($line in @(
+                @{ Text = Get-WinUtilGuidedText $option.Label; Size = 15; Bold = $true },
+                @{ Text = Get-WinUtilGuidedText $option.Detail; Size = 13; Bold = $false }
+            )) {
+                $text = New-Object Windows.Controls.TextBlock
+                $text.Text = $line.Text
+                $text.FontSize = $line.Size
+                $text.TextWrapping = 'Wrap'
+                $text.Background = [Windows.Media.Brushes]::Transparent
+                if ($line.Bold) { $text.FontWeight = 'Bold' } else { $text.Opacity = 0.8; $text.Margin = '0,3,0,0' }
+                $text.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'MainForegroundColor')
+                $content.Children.Add($text) | Out-Null
+            }
+            $sync.GuidedOptionBoxes.Add($box)
+
+            if (-not $asToggles) {
+                $box.Margin = '0,0,0,10'
+                $box.Content = $content
+                $sync.WPFGuidedOptions.Children.Add($box) | Out-Null
+                continue
+            }
+
+            # Settings-style row: text on the left, the same switch the Tweaks tab
+            # uses on the right. Clicking anywhere on the row flips it.
+            $box.SetResourceReference([Windows.FrameworkElement]::StyleProperty, 'ColorfulToggleSwitchStyle')
+            $box.VerticalAlignment = 'Center'
+            $box.Margin = '20,0,0,0'
+            $box.IsHitTestVisible = $false
+            [System.Windows.Automation.AutomationProperties]::SetName($box, (Get-WinUtilGuidedText $option.Label))
+            $grid = New-Object Windows.Controls.Grid
+            foreach ($width in @('*', 'Auto')) {
+                $column = New-Object Windows.Controls.ColumnDefinition
+                $column.Width = $width
+                $grid.ColumnDefinitions.Add($column) | Out-Null
+            }
+            [Windows.Controls.Grid]::SetColumn($box, 1)
+            $grid.Children.Add($content) | Out-Null
+            $grid.Children.Add($box) | Out-Null
+            $row = New-Object Windows.Controls.Border
+            $row.Child = $grid
+            $row.Tag = $box
+            $row.Padding = '16,12'
+            $row.Margin = '0,0,0,10'
+            $row.CornerRadius = '6'
+            $row.BorderThickness = '1'
+            $row.Cursor = [Windows.Input.Cursors]::Hand
+            $row.SetResourceReference([Windows.Controls.Border]::BackgroundProperty, 'TweakHelpSectionColor')
+            $row.SetResourceReference([Windows.Controls.Border]::BorderBrushProperty, 'TweakHelpBorderColor')
+            $row.Add_MouseLeftButtonUp({ $this.Tag.IsChecked = -not [bool]$this.Tag.IsChecked })
+            $sync.WPFGuidedOptions.Children.Add($row) | Out-Null
+        }
+    }
+
+    $yes = Get-WinUtilGuidedText $question.YesLabel
+    $no = Get-WinUtilGuidedText $question.NoLabel
+    $sync.WPFGuidedYes.Content = if ($yes) { $yes } elseif ($isSpanish) { 'Sí' } else { 'Yes' }
+    $sync.WPFGuidedNo.Content = if ($no) { $no } else { 'No' }
+    # Advanced questions highlight neither answer. ClearValue restores the
+    # window's implicit Button style; assigning $null would fall back to the
+    # system theme.
+    if ($recommended) {
+        $sync.WPFGuidedYes.Style = $sync.Form.FindResource('GuidedPrimaryButton')
+    } else {
+        $sync.WPFGuidedYes.ClearValue([Windows.FrameworkElement]::StyleProperty)
+    }
+    $sync.WPFGuidedBack.Content = if ($isSpanish) { 'Atrás' } else { 'Back' }
+
+    Show-WinUtilGuidedPanel -Panel 'Wizard'
+}
+
+function Save-WinUtilGuidedOptions {
+    # Keeps the current checkbox choices when the view is redrawn.
+    param([bool]$Answer = $true)
+    $questions = @(Get-WinUtilGuidedQuestions)
+    $question = $questions[$sync.GuidedState.Index]
+    if (-not $question.Options) { return $null }
+    $selected = @{}
+    foreach ($box in @($sync.GuidedOptionBoxes)) {
+        $selected[[string]$box.Tag] = ($Answer -and $box.IsChecked -eq $true)
+    }
+    $sync.GuidedState.Options[$question.Id] = $selected
+    return $selected
+}
+
+function Submit-WinUtilGuidedAnswer {
+    param([Parameter(Mandatory)][bool]$Answer)
+    $questions = @(Get-WinUtilGuidedQuestions)
+    $question = $questions[$sync.GuidedState.Index]
+    $selected = Save-WinUtilGuidedOptions -Answer $Answer
+    $sync.GuidedState.Answers[$question.Id] = if ($question.Options) { [bool](@($selected.Values) -contains $true) } else { $Answer }
+
+    if ($sync.GuidedState.ReturnToSummary) {
+        $sync.GuidedState.ReturnToSummary = $false
+        Show-WinUtilGuidedSummary
+        return
+    }
+    Show-WinUtilGuidedQuestion -Index ($sync.GuidedState.Index + 1)
+}
+
+function Step-WinUtilGuidedBack {
+    if ($sync.GuidedState.ReturnToSummary) {
+        $sync.GuidedState.ReturnToSummary = $false
+        Show-WinUtilGuidedSummary
+    } elseif ($sync.GuidedState.Index -le 0) {
+        Show-WinUtilModeChooser
+    } else {
+        Show-WinUtilGuidedQuestion -Index ($sync.GuidedState.Index - 1)
+    }
+}
+
+function Show-WinUtilGuidedSummary {
+    $isSpanish = ((Get-WinUtilGuidedLanguage) -eq 'es')
+    $plan = Get-WinUtilGuidedPlan -Answers $sync.GuidedState.Answers -Options $sync.GuidedState.Options
+    $sync.GuidedPlan = $plan
+    $sync.GuidedState.Index = @(Get-WinUtilGuidedQuestions).Count
+    $count = @($plan.Items).Count
+
+    $sync.WPFGuidedSummaryTitle.Text = if ($count -eq 0) {
+        if ($isSpanish) { 'No hay cambios para aplicar' } else { 'There are no changes to apply' }
+    } elseif ($isSpanish) { "Se aplicarán $count cambios" } else { "$count changes will be applied" }
+    $sync.WPFGuidedSummarySubtitle.Text = if ($isSpanish) {
+        'Lo que respondiste con No no se toca. Pulsa Cambiar para corregir una respuesta.'
+    } else { 'Anything you answered No to is left alone. Click Change to correct an answer.' }
+    $sync.WPFGuidedSummaryNote.Text = if (@($plan.Items | Where-Object { -not $_.Reversible }).Count -gt 0) {
+        if ($isSpanish) { 'Los cambios marcados "No se puede deshacer" no vuelven atrás. El resto se puede revertir desde el modo avanzado.' }
+        else { 'Changes marked "Cannot be undone" cannot be reverted. Everything else can be reverted from advanced mode.' }
+    } elseif ($isSpanish) { 'Todo se puede revertir después desde el modo avanzado.' } else { 'Everything can be reverted later from advanced mode.' }
+
+    $list = $sync.WPFGuidedSummaryList
+    $list.Children.Clear()
+    $row = 0
+    foreach ($item in @($plan.Items)) {
+        $grid = New-Object Windows.Controls.Grid
+        $grid.Margin = '0'
+        foreach ($width in @('170', '*', 'Auto', 'Auto')) {
+            $column = New-Object Windows.Controls.ColumnDefinition
+            $column.Width = $width
+            $grid.ColumnDefinitions.Add($column) | Out-Null
+        }
+        if ($row % 2 -eq 0) { $grid.SetResourceReference([Windows.Controls.Panel]::BackgroundProperty, 'TweakHelpSectionColor') }
+
+        $category = New-Object Windows.Controls.TextBlock
+        $category.Text = $item.Category
+        $category.FontWeight = 'SemiBold'
+        $category.Margin = '14,9,8,9'
+        $category.VerticalAlignment = 'Center'
+        $category.Background = [Windows.Media.Brushes]::Transparent
+        $category.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, $(if ($item.Advanced) { 'ProgressBarWarningColor' } else { 'LinkForegroundColor' }))
+        [Windows.Controls.Grid]::SetColumn($category, 0)
+
+        $label = New-Object Windows.Controls.TextBlock
+        $label.Text = $item.Label
+        $label.FontSize = 14
+        $label.TextWrapping = 'Wrap'
+        $label.Margin = '0,9,8,9'
+        $label.VerticalAlignment = 'Center'
+        $label.Background = [Windows.Media.Brushes]::Transparent
+        $label.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'MainForegroundColor')
+        [Windows.Controls.Grid]::SetColumn($label, 1)
+
+        $tags = New-Object Windows.Controls.WrapPanel
+        $tags.VerticalAlignment = 'Center'
+        $tags.Margin = '0,6,0,0'
+        if ($item.Reboot) { $tags.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'Reinicio' } else { 'Restart' }) -Color '#D4A017')) | Out-Null }
+        if (-not $item.Reversible) { $tags.Children.Add((New-WinUtilGuidedBadge -Text $(if ($isSpanish) { 'No se puede deshacer' } else { 'Cannot be undone' }) -Color '#E07B24')) | Out-Null }
+        [Windows.Controls.Grid]::SetColumn($tags, 2)
+
+        $change = New-Object Windows.Controls.Button
+        $change.Content = if ($isSpanish) { 'Cambiar' } else { 'Change' }
+        $change.Width = [double]::NaN
+        $change.Height = 30
+        $change.Margin = '4,4,10,4'
+        $change.Tag = [int]$item.Index
+        $change.Add_Click({
+            $sync.GuidedState.ReturnToSummary = $true
+            Show-WinUtilGuidedQuestion -Index ([int]$this.Tag)
+        })
+        [Windows.Controls.Grid]::SetColumn($change, 3)
+
+        foreach ($cell in @($category, $label, $tags, $change)) { $grid.Children.Add($cell) | Out-Null }
+        $list.Children.Add($grid) | Out-Null
+        $row++
+    }
+
+    $sync.WPFGuidedApply.Content = if ($isSpanish) { "Aplicar $count cambios" } else { "Apply $count changes" }
+    $sync.WPFGuidedApply.IsEnabled = ($count -gt 0)
+    $sync.WPFGuidedReview.Content = if ($isSpanish) { 'Revisar en modo avanzado' } else { 'Review in advanced mode' }
+    $sync.WPFGuidedSummaryBack.Content = if ($isSpanish) { 'Atrás' } else { 'Back' }
+    Show-WinUtilGuidedPanel -Panel 'Summary'
+}
+
+function Invoke-WinUtilGuidedReview {
+    $sync.GuidedReviewPlan = $sync.GuidedPlan
+    Exit-WinUtilGuided
+}
+
+function Complete-WinUtilGuidedReview {
+    # Marks the plan in the main window's Tweaks tab instead of applying it.
+    # Toggle switches apply on click, so they are listed rather than flipped.
+    $plan = $sync.GuidedReviewPlan
+    $sync.GuidedReviewPlan = $null
+    if (-not $plan) { return }
+    Invoke-WPFTab 'WPFTab2BT'
+
+    $selection = @($plan.Tweaks)
+    if ($plan.RestorePoint) { $selection = @('WPFTweaksRestorePoint') + $selection }
+    Invoke-WPFPresets -preset $selection -imported $true -checkboxfilterpattern 'WPFTweak*'
+    foreach ($change in @($plan.GroupChanges) + @($plan.TaskChanges)) {
+        $checkbox = $sync[$change.Key]
+        if ($checkbox -and $checkbox.IsEnabled -and $checkbox.IsChecked -ne $true) { $checkbox.IsChecked = $true }
+    }
+
+    $toggleNames = @($plan.Toggles | Where-Object {
+        [bool](Get-WinUtilToggleStatus -ToggleSwitch $_.Key) -ne [bool]$_.State
+    } | ForEach-Object {
+        $localized = Get-WinUtilLocalizedEntry -Key $_.Key
+        $name = if ($localized -and $localized.Content) { $localized.Content } else { $sync.configs.tweaks.$($_.Key).Content }
+        $state = if ($_.State) { 'ON' } else { 'OFF' }
+        "$name -> $state"
+    })
+    if ($plan.PowerPlan) {
+        $toggleNames += "$(Get-WinUtilGuidedStepLabel -Key 'WPFAddUltPerf') -> $(if ((Get-WinUtilGuidedLanguage) -eq 'es') { 'botón en Planes de rendimiento' } else { 'button under Performance Plans' })"
+    }
+    if ($toggleNames.Count -gt 0) {
+        $message = if ((Get-WinUtilGuidedLanguage) -eq 'es') {
+            "Se marcaron los ajustes del modo guiado. Estos interruptores se aplican al instante, así que no se cambiaron; ajústalos tú en Personalizar preferencias:`n`n$($toggleNames -join "`n")"
+        } else {
+            "The guided choices are now selected. These switches apply instantly, so they were not changed; set them yourself in Customize Preferences:`n`n$($toggleNames -join "`n")"
+        }
+        Show-WinUtilMessage -Title 'APBOptimizer' -Message (Convert-WinUtilTextEncoding -Text $message) -Button 'OK' -Icon 'Information' | Out-Null
+    }
+}
+
+function Step-WinUtilGuidedJob {
+    # The main window's progress bar may be hidden, so the guided window
+    # shows the same progress on its own bar.
+    param([string]$Status, [int]$Percent)
+    Step-WinUtilJob -Status $Status -Percent $Percent
+    if (Test-WinUtilUIAlive) {
+        Invoke-WPFUIThread -Async -Parameters @{ Status = $Status; Percent = $Percent } -ScriptBlock {
+            param($Status, $Percent)
+            if ($sync.WPFGuidedJobProgress) {
+                $sync.WPFGuidedJobProgress.Value = $Percent
+                $sync.WPFGuidedJobLabel.Text = $Status
+            }
+        }
+    }
+}
+
+function Get-WinUtilGuidedStepLabel {
+    param([Parameter(Mandatory)][string]$Key)
+    $localized = if ($sync.configs.es) { $sync.configs.es.PSObject.Properties[$Key] } else { $null }
+    $name = if ($localized -and $localized.Value.Content) { $localized.Value.Content } elseif ($sync.configs.tweaks.$Key.Content) { $sync.configs.tweaks.$Key.Content } else { $Key }
+    return Convert-WinUtilTextEncoding -Text ([string]$name)
+}
+
+function Get-WinUtilGuidedErrorMark {
+    if ($null -eq $sync.LoggedErrors) { return 0 }
+    return $sync.LoggedErrors.Count
+}
+
+function Add-WinUtilGuidedFailures {
+    # Errors logged since -Since belong to the step that just ran, so the finish
+    # screen can say which change failed and why.
+    param(
+        [Parameter(Mandatory)][string]$Key,
+        [int]$Since,
+        [Parameter(Mandatory)][AllowEmptyCollection()][System.Collections.Generic.List[object]]$Failures
+    )
+    if ($null -eq $sync.LoggedErrors) { return }
+    foreach ($entry in @($sync.LoggedErrors.ToArray() | Select-Object -Skip $Since)) {
+        $message = ([string]$entry) -replace '^\[[^\]]*\]\s*', '' -replace '^Non-terminating error\s*:\s*', ''
+        $Failures.Add([pscustomobject]@{ Step = (Get-WinUtilGuidedStepLabel -Key $Key); Message = $message })
+    }
+}
+
+function Invoke-WinUtilGuidedApply {
+    $plan = $sync.GuidedPlan
+    if (-not $plan -or @($plan.Items).Count -eq 0) { return }
+    if ($sync.ActiveJob) {
+        Show-WinUtilMessage -Message "$($sync.ActiveJob) sigue en curso. Espera a que termine antes de aplicar." -Title 'APBOptimizer' -Button 'OK' -Icon 'Warning' | Out-Null
+        return
+    }
+
+    $isSpanish = ((Get-WinUtilGuidedLanguage) -eq 'es')
+    $sync.WPFGuidedDoneTitle.Text = if ($isSpanish) { 'Aplicando cambios...' } else { 'Applying changes...' }
+    $sync.WPFGuidedDoneText.Text = if ($isSpanish) { 'Si algo falla, el resto continúa y queda registrado en el log.' } else { 'If something fails, the rest continues and it is written to the log.' }
+    $sync.WPFGuidedDoneButtons.Visibility = 'Collapsed'
+    $sync.WPFGuidedErrors.Visibility = 'Collapsed'
+    $sync.WPFGuidedJobPanel.Visibility = 'Visible'
+    $sync.WPFGuidedJobProgress.Value = 0
+    $sync.WPFGuidedJobLabel.Text = ''
+    Show-WinUtilGuidedPanel -Panel 'Done'
+    $sync.GuidedState.Completed = $true
+
+    Write-WinUtilLog -Component 'Guided' -Message "Guided apply requested: restore point $($plan.RestorePoint), power plan $($plan.PowerPlan), $(@($plan.Tweaks).Count) tweak(s), $(@($plan.Toggles).Count) toggle(s), $(@($plan.GroupChanges).Count) service change(s), $(@($plan.TaskChanges).Count) task change(s)."
+
+    Start-WinUtilJob -Name 'Guided' -Description 'Applying guided mode changes' -Parameters @{
+        RestorePoint = [bool]$plan.RestorePoint
+        PowerPlan = [bool]$plan.PowerPlan
+        Tweaks = @($plan.Tweaks)
+        Toggles = @($plan.Toggles)
+        GroupChanges = @($plan.GroupChanges)
+        TaskChanges = @($plan.TaskChanges)
+        Reboot = [bool]$plan.Reboot
+    } -ScriptBlock {
+        param($RestorePoint, $PowerPlan, $Tweaks, $Toggles, $GroupChanges, $TaskChanges, $Reboot)
+
+        $totalSteps = [Math]::Max(([int]$RestorePoint + [int]$PowerPlan + @($Tweaks).Count + @($Toggles).Count + @($GroupChanges).Count + @($TaskChanges).Count), 1)
+        $completedSteps = 0
+        $failures = [System.Collections.Generic.List[object]]::new()
+
+        # The restore point has to be taken before anything else changes.
+        if ($RestorePoint) {
+            Step-WinUtilGuidedJob -Status 'Creating restore point' -Percent 0
+            $errorMark = Get-WinUtilGuidedErrorMark
+            Measure-WinUtilStep -Scope 'Guided' -Name 'WPFTweaksRestorePoint' -ScriptBlock {
+                Invoke-WinUtilTweaks 'WPFTweaksRestorePoint'
+            }
+            Add-WinUtilGuidedFailures -Key 'WPFTweaksRestorePoint' -Since $errorMark -Failures $failures
+            $completedSteps++
+        }
+        # Before the tweaks: the USB/PCIe power tweak writes to the active plan,
+        # so the new plan has to be active first.
+        if ($PowerPlan) {
+            Step-WinUtilGuidedJob -Status "Applying WPFAddUltPerf ($($completedSteps + 1)/$totalSteps)" -Percent ([int](($completedSteps / $totalSteps) * 100))
+            $errorMark = Get-WinUtilGuidedErrorMark
+            Measure-WinUtilStep -Scope 'Guided' -Name 'WPFAddUltPerf' -ScriptBlock {
+                try { Invoke-WPFUltimatePerformance -Enable } catch {
+                    Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context 'Ultimate Performance plan'
+                }
+            }
+            Add-WinUtilGuidedFailures -Key 'WPFAddUltPerf' -Since $errorMark -Failures $failures
+            $completedSteps++
+        }
+        foreach ($tweak in @($Tweaks)) {
+            Step-WinUtilGuidedJob -Status "Applying $tweak ($($completedSteps + 1)/$totalSteps)" -Percent ([int](($completedSteps / $totalSteps) * 100))
+            $errorMark = Get-WinUtilGuidedErrorMark
+            Measure-WinUtilStep -Scope 'Guided' -Name $tweak -ScriptBlock {
+                Invoke-WinUtilTweaks $tweak
+            }
+            Add-WinUtilGuidedFailures -Key $tweak -Since $errorMark -Failures $failures
+            $completedSteps++
+        }
+        foreach ($toggle in @($Toggles)) {
+            $key = [string]$toggle.Key
+            $desired = [bool]$toggle.State
+            Step-WinUtilGuidedJob -Status "Applying $key ($($completedSteps + 1)/$totalSteps)" -Percent ([int](($completedSteps / $totalSteps) * 100))
+            $errorMark = Get-WinUtilGuidedErrorMark
+            Measure-WinUtilStep -Scope 'Guided' -Name $key -ScriptBlock {
+                # Only flip a switch that is not already in the chosen state.
+                try {
+                    if ([bool](Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache) -ne $desired) {
+                        Invoke-WinUtilTweaks -CheckBox $key -undo (-not $desired)
+                    }
+                    if ($null -ne $sync.ToggleStatusCache) {
+                        $sync.ToggleStatusCache[$key] = [bool](Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache)
+                    }
+                } catch {
+                    Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context "Toggle $key"
+                }
+            }
+            Add-WinUtilGuidedFailures -Key $key -Since $errorMark -Failures $failures
+            $completedSteps++
+        }
+        foreach ($groupChange in @($GroupChanges)) {
+            $key = [string]$groupChange.Key
+            Step-WinUtilGuidedJob -Status "Applying service $key ($($completedSteps + 1)/$totalSteps)" -Percent ([int](($completedSteps / $totalSteps) * 100))
+            $errorMark = Get-WinUtilGuidedErrorMark
+            Measure-WinUtilStep -Scope 'Guided' -Name $key -ScriptBlock {
+                Invoke-WinUtilPendingGroupChanges -Changes @($groupChange)
+            }
+            Add-WinUtilGuidedFailures -Key $key -Since $errorMark -Failures $failures
+            $completedSteps++
+        }
+        if (@($TaskChanges).Count -gt 0) {
+            # One scheduler read decides which tasks exist on this PC.
+            $taskSnapshot = $null
+            $errorMark = Get-WinUtilGuidedErrorMark
+            try { $taskSnapshot = @(Get-ScheduledTask -ErrorAction Stop) } catch {
+                Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context 'Read scheduled tasks'
+            }
+            Add-WinUtilGuidedFailures -Key 'WPFTaskGroupTelemetry' -Since $errorMark -Failures $failures
+        }
+        foreach ($taskChange in @($TaskChanges)) {
+            $key = [string]$taskChange.Key
+            Step-WinUtilGuidedJob -Status "Applying task $key ($($completedSteps + 1)/$totalSteps)" -Percent ([int](($completedSteps / $totalSteps) * 100))
+            if ($null -ne $taskSnapshot) {
+                $errorMark = Get-WinUtilGuidedErrorMark
+                Measure-WinUtilStep -Scope 'Guided' -Name $key -ScriptBlock {
+                    try {
+                        $taskName = $sync.configs.tweaks.$key.scheduledTask.Name
+                        $info = Get-WinUtilTelemetryTaskInfo -Name $taskName -TaskSnapshot $taskSnapshot
+                        if ($info.Present) {
+                            Invoke-WinUtilPendingTaskChanges -Changes @($taskChange)
+                        } else {
+                            Write-WinUtilLog -Component 'Guided' -Message "Scheduled task '$taskName' is not on this PC. Skipping."
+                        }
+                    } catch {
+                        Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context "Task $key"
+                    }
+                }
+                Add-WinUtilGuidedFailures -Key $key -Since $errorMark -Failures $failures
+            }
+            $completedSteps++
+        }
+
+        if (Test-WinUtilUIAlive) {
+            Invoke-WPFUIThread -Parameters @{ Errors = [int]$global:WinUtilJobErrorCount; Reboot = [bool]$Reboot; Failures = @($failures) } -ScriptBlock {
+                param($Errors, $Reboot, $Failures)
+                Complete-WinUtilGuidedApply -Errors $Errors -Reboot $Reboot -Failures $Failures
+            }
+        }
+    }
+}
+
+function Complete-WinUtilGuidedApply {
+    param([int]$Errors, [bool]$Reboot, [object[]]$Failures = @())
+    $isSpanish = ((Get-WinUtilGuidedLanguage) -eq 'es')
+    $sync.WPFGuidedDoneTitle.Text = if ($Errors -gt 0) {
+        if ($isSpanish) { "Terminado con $Errors error(es)" } else { "Finished with $Errors error(s)" }
+    } elseif ($isSpanish) { 'Listo: cambios aplicados' } else { 'Done: changes applied' }
+    $lines = @()
+    if ($Errors -gt 0) {
+        $lines += if (@($Failures).Count -gt 0) {
+            if ($isSpanish) { 'Algunos cambios no se pudieron aplicar; el resto sí. Abajo está cada error.' } else { 'Some changes could not be applied; the rest were. Each error is listed below.' }
+        } elseif ($isSpanish) { 'Algunos cambios no se pudieron aplicar; el resto sí. El log indica cuáles y por qué.' } else { 'Some changes could not be applied; the rest were. The log says which ones and why.' }
+    }
+    $lines += if ($Reboot) {
+        if ($isSpanish) { 'Reinicia Windows para terminar de aplicar algunos cambios.' } else { 'Restart Windows to finish applying some changes.' }
+    } elseif ($isSpanish) { 'Los cambios ya están activos.' } else { 'The changes are already active.' }
+    $sync.WPFGuidedDoneText.Text = $lines -join ' '
+    $sync.WPFGuidedErrorsList.Children.Clear()
+    foreach ($failure in @($Failures)) {
+        $row = New-Object Windows.Controls.TextBlock
+        $row.TextWrapping = 'Wrap'
+        $row.FontSize = 13
+        $row.Margin = '0,0,0,8'
+        $row.Background = [Windows.Media.Brushes]::Transparent
+        $row.SetResourceReference([Windows.Controls.TextBlock]::ForegroundProperty, 'MainForegroundColor')
+        $stepRun = New-Object Windows.Documents.Run -ArgumentList (Convert-WinUtilTextEncoding -Text ([string]$failure.Step))
+        $stepRun.FontWeight = 'Bold'
+        $row.Inlines.Add($stepRun) | Out-Null
+        $row.Inlines.Add((New-Object Windows.Documents.LineBreak)) | Out-Null
+        $row.Inlines.Add((New-Object Windows.Documents.Run -ArgumentList (Convert-WinUtilTextEncoding -Text ([string]$failure.Message)))) | Out-Null
+        $sync.WPFGuidedErrorsList.Children.Add($row) | Out-Null
+    }
+    $sync.WPFGuidedErrors.Visibility = if (@($Failures).Count -gt 0) { 'Visible' } else { 'Collapsed' }
+    $sync.WPFGuidedJobProgress.Value = 100
+    $sync.WPFGuidedJobPanel.Visibility = 'Collapsed'
+    $sync.WPFGuidedDoneAdvanced.Content = if ($isSpanish) { 'Ir al modo avanzado' } else { 'Go to advanced mode' }
+    $sync.WPFGuidedDoneHome.Content = if ($isSpanish) { 'Volver al inicio' } else { 'Back to start' }
+    $sync.WPFGuidedRestart.Content = if ($isSpanish) { 'Reiniciar ahora' } else { 'Restart now' }
+    $sync.WPFGuidedRestart.Visibility = if ($Reboot) { 'Visible' } else { 'Collapsed' }
+    $sync.WPFGuidedDoneButtons.Visibility = 'Visible'
+
+    # Redraw the Tweaks tab from the new state; import mode keeps the redraw
+    # from re-running any toggle.
+    if ($sync.InitializedTabs -and $sync.InitializedTabs['Tweaks']) {
+        $wasImporting = $sync.ImportInProgress
+        $sync.ImportInProgress = $true
+        try {
+            Invoke-WPFUIElements -configVariable $sync.configs.tweaks -targetGridName 'tweakspanel' -columncount 2
+            Reset-WPFCheckBoxes -doToggles $true
+            Find-TweaksByNameOrDescription -SearchString $sync.SearchBar.Text
+        } catch {
+            Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context 'Refresh Tweaks tab'
+        } finally { $sync.ImportInProgress = $wasImporting }
+    }
+}
+
+function Restart-WinUtilComputer {
+    $message = if ((Get-WinUtilGuidedLanguage) -eq 'es') {
+        'Windows se reiniciará ahora. Guarda tu trabajo y cierra los programas abiertos antes de continuar. ¿Reiniciar?'
+    } else { 'Windows will restart now. Save your work and close open programs before continuing. Restart?' }
+    if ([string](Show-WinUtilMessage -Title 'APBOptimizer' -Message (Convert-WinUtilTextEncoding -Text $message) -Button 'YesNo' -Icon 'Warning') -ne 'Yes') { return }
+    Write-WinUtilLog -Component 'Guided' -Message 'Restart requested from guided mode.'
+    Restart-Computer -Force
+}
+
 function Invoke-WinUtilScript {
     <#
 
@@ -2497,7 +3481,8 @@ function New-WinUtilSessionState {
     $variables = @(
         @{ Name = "sync"; Value = $sync },
         @{ Name = "PARAM_OFFLINE"; Value = $PARAM_OFFLINE },
-        @{ Name = "inputXML"; Value = $inputXML }
+        @{ Name = "inputXML"; Value = $inputXML },
+        @{ Name = "guidedXML"; Value = $guidedXML }
     )
 
     foreach ($variable in $variables) {
@@ -2816,7 +3801,7 @@ function Reset-WPFCheckBoxes {
             if ($toggle.Key -like "WPFToggle*" -and $toggle.Value -is [System.Windows.Controls.CheckBox] -and $importedToggles.Contains($toggle.Key)) {
                 $sync[$toggle.Key].IsChecked = $true
                 $parentGroup = [string]$sync.configs.tweaks.$($toggle.Key).ParentGroup
-                if ($parentGroup -in @('WPFTaskGroupTelemetry', 'WPFServiceGroupDiagnostics', 'WPFDriverGroupOptional') -and $sync.Form -and
+                if ($parentGroup -in @('WPFTaskGroupTelemetry', 'WPFServiceGroupDiagnostics', 'WPFServiceGroupUseless', 'WPFDriverGroupOptional') -and $sync.Form -and
                     $sync[$toggle.Key].IsEnabled -and $sync[$toggle.Key].Visibility -eq [System.Windows.Visibility]::Visible) {
                     $pendingName = if ($parentGroup -eq 'WPFTaskGroupTelemetry') {
                         'PendingTaskSelections'
@@ -3029,86 +4014,129 @@ function Set-WinUtilCPUMitigations {
     Write-WinUtilLog -Component 'CPUMitigations' -Message 'Original CPU mitigation registry values restored. Restart Windows for the changes to take effect.'
 }
 
-function Get-WinUtilDefenderRealtimeState {
-    # Only supported Defender cmdlets are used. Never modify the services,
-    # protected drivers, Tamper Protection, ACLs or Security Center.
-    foreach ($command in @('Get-MpComputerStatus', 'Get-MpPreference', 'Set-MpPreference')) {
-        if (-not (Get-Command $command -ErrorAction SilentlyContinue)) {
-            return [pscustomobject]@{
-                Available = $false; Enabled = $false; TamperProtected = $false
-                Error = 'Microsoft Defender PowerShell cmdlets are unavailable.'
-            }
-        }
-    }
-    try {
-        $status = Get-MpComputerStatus -ErrorAction Stop
-        $preferences = Get-MpPreference -ErrorAction Stop
-        if ($null -eq $status -or $null -eq $preferences) { throw 'Defender did not return its protection status.' }
-        return [pscustomobject]@{
-            Available = $true
-            Enabled = [bool]$status.RealTimeProtectionEnabled
-            TamperProtected = [bool]$status.IsTamperProtected
-            Error = ''
-        }
-    } catch {
-        return [pscustomobject]@{
-            Available = $false; Enabled = $false; TamperProtected = $false
-            Error = $_.Exception.Message
-        }
-    }
+function Get-WinUtilDevicePowerSettingList {
+    # Only the plugged-in (AC) index is changed; battery behavior stays as configured.
+    @(
+        [pscustomobject]@{ Name = 'USB selective suspend'; Subgroup = '2a737441-1930-4402-8d77-b2bebba308a3'; Setting = '48e6b7a6-50f5-4782-a5d4-53bb8f07e226'; Max = 1 }
+        [pscustomobject]@{ Name = 'PCI Express Link State Power Management'; Subgroup = '501a4d13-42af-4429-9fd1-a8218c268e20'; Setting = 'ee12f906-d277-404b-b6da-e5fa1a576df5'; Max = 2 }
+    )
 }
 
-function Update-WinUtilDefenderRealtimeStatusUI {
-    if ($null -eq $sync.WPFDefenderRealtimeStatus) { return }
-    $state = Get-WinUtilDefenderRealtimeState
-    $statusText = if (-not $state.Available) {
-        if ($sync.Language -eq 'es') { "Estado: no se puede consultar Defender. $($state.Error)" }
-        else { "Status: cannot query Defender. $($state.Error)" }
-    } elseif ($state.Enabled -and $state.TamperProtected) {
-        if ($sync.Language -eq 'es') { 'Estado: protección en tiempo real ACTIVADA. La protección contra alteraciones impide desactivarla desde PowerShell.' }
-        else { 'Status: real-time protection ON. Tamper Protection prevents disabling it through PowerShell.' }
-    } elseif ($state.Enabled) {
-        if ($sync.Language -eq 'es') { 'Estado: protección en tiempo real ACTIVADA.' }
-        else { 'Status: real-time protection ON.' }
-    } else {
-        if ($sync.Language -eq 'es') { 'Estado: protección en tiempo real DESACTIVADA. Windows puede reactivarla automáticamente.' }
-        else { 'Status: real-time protection OFF. Windows may automatically reactivate it.' }
+function Invoke-WinUtilPowerCfg {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+
+    $output = @(powercfg @Arguments)
+    if ($LASTEXITCODE -ne 0) {
+        throw "powercfg $($Arguments -join ' ') failed: $($output -join ' ')"
     }
-    Invoke-WPFUIThread -Async -Parameters @{
-        Text = $statusText
-        CanDisable = [bool]($state.Available -and $state.Enabled -and -not $state.TamperProtected)
-        CanEnable = [bool]($state.Available -and -not $state.Enabled)
-    } -ScriptBlock {
-        param($Text, $CanDisable, $CanEnable)
-        if ($sync.WPFDefenderRealtimeStatus) { $sync.WPFDefenderRealtimeStatus.Text = $Text }
-        if ($sync.WPFDisableDefenderRealtime) { $sync.WPFDisableDefenderRealtime.IsEnabled = $CanDisable }
-        if ($sync.WPFEnableDefenderRealtime) { $sync.WPFEnableDefenderRealtime.IsEnabled = $CanEnable }
-    }
+    return $output
 }
 
-function Set-WinUtilDefenderRealtime {
-    param([Parameter(Mandatory)][ValidateSet('Disable', 'Enable')][string]$Mode)
+function Get-WinUtilActivePowerScheme {
+    $output = Invoke-WinUtilPowerCfg -Arguments @('/getactivescheme')
+    $match = [regex]::Match(($output -join ' '), '[0-9a-fA-F]{8}(-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}')
+    if (-not $match.Success) { throw 'Could not find the active power plan GUID.' }
+    return $match.Value.ToLowerInvariant()
+}
+
+function Get-WinUtilPowerSettingAcValue {
+    param([Parameter(Mandatory)][string]$Scheme, [Parameter(Mandatory)]$Setting)
+
+    $output = Invoke-WinUtilPowerCfg -Arguments @('/query', $Scheme, $Setting.Subgroup, $Setting.Setting)
+    # Labels are localized; the current AC and DC indexes are the only hex values.
+    $values = @($output | ForEach-Object {
+        if ([string]$_ -match ':\s*0x([0-9a-fA-F]+)\s*$') { [Convert]::ToInt32($Matches[1], 16) }
+    })
+    if ($values.Count -ne 2) { throw "$($Setting.Name) is not available in power plan $Scheme." }
+    return $values[0]
+}
+
+function Get-WinUtilDevicePowerSavingBackup {
+    $saved = Get-WinUtilPowerThrottlingRegistryValue -Path 'HKLM:\SOFTWARE\OptiUtil\DevicePowerSavingBackup' -Name Snapshot
+    if (-not $saved.Present) { return $null }
+    if ($saved.Kind -ne 'String' -or [string]::IsNullOrWhiteSpace([string]$saved.Value)) {
+        throw 'Device power saving backup is empty or has an invalid type. No changes made.'
+    }
+    $backup = ConvertFrom-Json -InputObject ([string]$saved.Value) -ErrorAction Stop
+    $known = @(Get-WinUtilDevicePowerSettingList)
+    $entries = @($backup.Settings)
+    $valid = $backup.Version -eq 1 -and [string]$backup.Scheme -match '^[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}$' -and
+        $entries.Count -eq $known.Count
+    if ($valid) {
+        foreach ($entry in $entries) {
+            $setting = $known | Where-Object { $_.Setting -eq $entry.Setting }
+            if (-not $setting -or [string]$entry.AC -notmatch '^\d+$' -or [int]$entry.AC -gt $setting.Max) { $valid = $false }
+        }
+    }
+    if (-not $valid) { throw 'Unrecognized device power saving backup. No changes made.' }
+    return $backup
+}
+
+function Set-WinUtilDevicePowerSaving {
+    param([Parameter(Mandatory)][ValidateSet('Disable', 'Restore')][string]$Mode)
 
     if (-not (Test-WinUtilWindowsUpdateAdmin)) {
-        throw 'Administrator privileges are required to change Defender settings.'
+        throw 'Administrator privileges are required to change power plan settings.'
     }
-    $before = Get-WinUtilDefenderRealtimeState
-    if (-not $before.Available) { throw "Defender state unavailable: $($before.Error)" }
-    $disable = ($Mode -eq 'Disable')
-    if ($disable -and $before.TamperProtected) {
-        throw 'Tamper Protection is active. Windows blocks disabling real-time protection through PowerShell.'
-    }
-    if ($before.Enabled -eq (-not $disable)) {
-        Write-WinUtilLog -Component 'Defender' -Message "Real-time protection already in requested state: $Mode."
+
+    $backupPath = 'HKLM:\SOFTWARE\OptiUtil\DevicePowerSavingBackup'
+    $settings = @(Get-WinUtilDevicePowerSettingList)
+    $backup = Get-WinUtilDevicePowerSavingBackup
+    if ($Mode -eq 'Disable') {
+        $scheme = Get-WinUtilActivePowerScheme
+        if ($backup -and $backup.Scheme -ne $scheme) {
+            throw "Device power saving was already changed in power plan $($backup.Scheme). Undo it before applying to another plan."
+        }
+        if (-not $backup) {
+            $backup = [pscustomobject]@{
+                Version = 1
+                Scheme = $scheme
+                Settings = @($settings | ForEach-Object {
+                    [pscustomobject]@{ Setting = $_.Setting; AC = [int](Get-WinUtilPowerSettingAcValue -Scheme $scheme -Setting $_) }
+                })
+            }
+            # Save the plan's original AC indexes before modifying Windows.
+            $null = New-Item -Path $backupPath -Force -ErrorAction Stop
+            $null = New-ItemProperty -LiteralPath $backupPath -Name Snapshot -PropertyType String -Value ($backup | ConvertTo-Json -Depth 4 -Compress) -Force -ErrorAction Stop
+        }
+        foreach ($setting in $settings) {
+            $null = Invoke-WinUtilPowerCfg -Arguments @('/setacvalueindex', $scheme, $setting.Subgroup, $setting.Setting, '0')
+        }
+        $null = Invoke-WinUtilPowerCfg -Arguments @('/setactive', $scheme)
+        foreach ($setting in $settings) {
+            if ((Get-WinUtilPowerSettingAcValue -Scheme $scheme -Setting $setting) -ne 0) {
+                throw "Could not verify that $($setting.Name) is off; original values backed up for recovery."
+            }
+        }
+        Write-WinUtilLog -Component 'DevicePowerSaving' -Message "USB selective suspend and PCIe link state power management turned off (AC) in power plan $scheme."
         return
     }
 
-    Set-MpPreference -DisableRealtimeMonitoring $disable -ErrorAction Stop
-    $after = Get-WinUtilDefenderRealtimeState
-    if (-not $after.Available -or $after.Enabled -eq $disable) {
-        throw "Could not confirm the requested Defender state ($Mode). Check Tamper Protection and device policies."
+    if (-not $backup) {
+        throw 'No device power saving backup exists. Refusing to guess the original power plan settings.'
     }
-    Write-WinUtilLog -Component 'Defender' -Message "Real-time protection $Mode confirmed through Get-MpComputerStatus. Other security components unchanged."
+    $schemes = (Invoke-WinUtilPowerCfg -Arguments @('/list')) -join ' '
+    if ($schemes -notmatch [regex]::Escape($backup.Scheme)) {
+        # The plan was deleted together with its settings; nothing is left to restore.
+        Remove-ItemProperty -LiteralPath $backupPath -Name Snapshot -ErrorAction Stop
+        Write-WinUtilLog -Component 'DevicePowerSaving' -Level 'WARN' -Message "Power plan $($backup.Scheme) no longer exists; device power saving backup discarded."
+        return
+    }
+    foreach ($entry in @($backup.Settings)) {
+        $setting = $settings | Where-Object { $_.Setting -eq $entry.Setting }
+        $null = Invoke-WinUtilPowerCfg -Arguments @('/setacvalueindex', $backup.Scheme, $setting.Subgroup, $setting.Setting, [string][int]$entry.AC)
+    }
+    if ((Get-WinUtilActivePowerScheme) -eq $backup.Scheme) {
+        $null = Invoke-WinUtilPowerCfg -Arguments @('/setactive', $backup.Scheme)
+    }
+    foreach ($entry in @($backup.Settings)) {
+        $setting = $settings | Where-Object { $_.Setting -eq $entry.Setting }
+        if ((Get-WinUtilPowerSettingAcValue -Scheme $backup.Scheme -Setting $setting) -ne [int]$entry.AC) {
+            throw "Original $($setting.Name) value could not be verified; backup retained."
+        }
+    }
+    Remove-ItemProperty -LiteralPath $backupPath -Name Snapshot -ErrorAction Stop
+    Write-WinUtilLog -Component 'DevicePowerSaving' -Message "Original USB selective suspend and PCIe link state values restored in power plan $($backup.Scheme)."
 }
 
 function Set-WinUtilDNS {
@@ -3335,7 +4363,9 @@ function Update-WinUtilLanguageUI {
             $value = if ($translation -and $translation.Value.PSObject.Properties[$field]) {
                 $translation.Value.$field
             } else { $sync.LanguageOriginalUI[$originalKey] }
-            $control.$field = $value
+            # Fix legacy text decoded as ANSI by Windows PowerShell 5.1.
+            # XAML objects and correctly decoded JSON are left untouched.
+            $control.$field = Convert-WinUtilTextEncoding -Text $value
         }
     }
     if ($null -ne $sync.WPFLanguageSelector) {
@@ -3379,7 +4409,6 @@ function Set-WinUtilLanguage {
     Update-WinUtilLanguageUI
     if ($sync.currentTab -eq 'Advanced') {
         Update-WinUtilWindowsUpdateStatusUI
-        Update-WinUtilDefenderRealtimeStatusUI
     }
 
     # Rebuild only the localized labels, never the underlying tweak configuration.
@@ -6031,6 +7060,10 @@ function Start-WinUtilUserInterface {
             $sync.WPFOfflineBanner.Visibility = [System.Windows.Visibility]::Visible
         }
         Invoke-WPFTab 'WPFTab2BT' -Yield
+        # "Review in advanced mode" from the guided window marks its plan here.
+        if ($sync.GuidedReviewPlan) {
+            try { Complete-WinUtilGuidedReview } catch { Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context 'Review guided plan' }
+        }
         $sync["Form"].Focus()
         $sync["Form"].Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{ Initialize-WinUtilRunspacePool | Out-Null }) | Out-Null
         $sync["Form"].Dispatcher.BeginInvoke([System.Windows.Threading.DispatcherPriority]::Background, [action]{
@@ -6115,6 +7148,16 @@ function Start-WinUtilUserInterface {
         Invoke-WPFImpex -type "export"
     })
 
+    $sync["GuidedModeMenuItem"].Add_Click({
+        Invoke-WPFPopup -Action "Hide" -Popups @("Settings")
+        try {
+            $null = Show-WinUtilGuidedWindow -Start 'Resume' -Owner $sync.Form
+            if ($sync.GuidedReviewPlan) { Complete-WinUtilGuidedReview }
+        } catch {
+            Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context 'Open guided mode'
+        }
+    })
+
     $sync["AboutMenuItem"].Add_Click({
         Invoke-WPFPopup -Action "Hide" -Popups @("Settings")
 
@@ -6157,7 +7200,17 @@ function Start-WinUtilUserInterface {
         Write-WinUtilLog -Level "DEBUG" -Component "UI" -Message "timing: interface ready for input $sinceStart ms after start."
     }) | Out-Null
 
-    $sync["Form"].ShowDialog() | Out-Null
+    # The guided window is a separate launcher. The full interface opens only when the user
+    # picks advanced mode there.
+    try {
+        $openMain = Show-WinUtilGuidedWindow -Start 'Chooser'
+    } catch {
+        Write-WinUtilErrorRecord -ErrorRecord $_ -Component 'Guided' -Context 'Show guided window'
+        $openMain = $true
+    }
+    if ($openMain) {
+        $sync["Form"].ShowDialog() | Out-Null
+    }
 
     # ShowDialog returns once the window is gone; stop the dispatcher so this runspace can close
     [System.Windows.Threading.Dispatcher]::CurrentDispatcher.InvokeShutdown()
@@ -6625,7 +7678,10 @@ function Update-WinUtilServiceGroupMaster {
 
     # Null is a visual mixed state; IsThreeState stays false so the next user
     # click still means a binary bulk action.
-    $state = if ($available -eq 0 -or $checked -eq 0) { $false }
+    # A driver group whose installed drivers are all already disabled shows
+    # that real state instead of an unchecked, apparently active header.
+    $state = if ($available -eq 0) { [bool]$master.Tag.AllAlreadyDisabled }
+             elseif ($checked -eq 0) { $false }
              elseif ($checked -eq $available) { $true }
              else { $null }
     $master.Tag.Updating = $true
@@ -6636,6 +7692,58 @@ function Update-WinUtilServiceGroupMaster {
         $master.IsChecked = $state
     } finally {
         $master.Tag.Updating = $false
+    }
+}
+
+function Update-WinUtilServiceGroupState {
+    <#
+
+    .SYNOPSIS
+        Re-reads grouped service startup types after a tweak run
+
+    .DESCRIPTION
+        Other tweaks (Telemetry, Services) change the same services, and a failed
+        group change leaves Windows as it was. Without a refresh the cached baseline
+        and the checkboxes keep showing the state from when the panel was built.
+        Entries with a pending choice are left alone so a retry stays queued.
+
+    #>
+    param([string]$GroupName)
+
+    if (-not $GroupName) {
+        # Refresh every ServiceGroup in the catalog.
+        foreach ($property in $sync.configs.tweaks.PSObject.Properties) {
+            if ($property.Value.Type -eq 'ServiceGroup') {
+                Update-WinUtilServiceGroupState -GroupName $property.Name
+            }
+        }
+        return
+    }
+
+    $group = $sync.configs.tweaks.$GroupName
+    if (-not $group -or $null -eq $sync.ToggleStatusCache) { return }
+
+    $states = @{}
+    foreach ($key in @($group.Children)) {
+        if ($null -ne $sync.PendingGroupSelections -and $sync.PendingGroupSelections.ContainsKey($key)) { continue }
+        # Missing services read as not disabled; their checkboxes are hidden.
+        $states[$key] = [bool](Get-WinUtilToggleStatus -ToggleSwitch $key -BypassCache)
+        $sync.ToggleStatusCache[$key] = $states[$key]
+    }
+    if ($states.Count -eq 0) { return }
+
+    Invoke-WPFUIThread -Parameters @{ States = $states; GroupName = $GroupName } -ScriptBlock {
+        param($States, $GroupName)
+        foreach ($key in @($States.Keys)) {
+            $checkbox = $sync[$key]
+            if ($null -eq $checkbox -or $checkbox.IsChecked -eq $States[$key]) { continue }
+            # Updating keeps the change handler from staging a phantom operation.
+            $checkbox.Tag.Updating = $true
+            try { $checkbox.IsChecked = $States[$key] }
+            finally { $checkbox.Tag.Updating = $false }
+            Invoke-WPFSelectedCheckboxesUpdate -type $(if ($States[$key]) { 'Add' } else { 'Remove' }) -checkboxName $key
+        }
+        Update-WinUtilServiceGroupMaster -GroupName $GroupName
     }
 }
 
@@ -7142,6 +8250,12 @@ function Invoke-WinUtilAutoRun {
         [int]$StopTimeoutSeconds = 30
     )
 
+    # Bulk AppX removal requires an explicit UI confirmation. A saved/imported
+    # configuration must not uninstall apps silently in a headless run.
+    if (@($sync.selectedTweaks) -contains 'WPFTweaksDeBloat') {
+        throw 'Bulk Microsoft Store app removal requires interactive confirmation in APBOptimizer. Remove WPFTweaksDeBloat from the headless configuration.'
+    }
+
     $steps = @(
         [pscustomobject]@{ Name = 'Tweaks';  Count = @($sync.selectedTweaks).Count;  Action = { Invoke-WPFtweaksbutton } }
         [pscustomobject]@{ Name = 'Toggles'; Count = @($sync.selectedToggles).Count; Action = { Invoke-WPFToggleSelections } }
@@ -7284,6 +8398,19 @@ function Invoke-WPFButton {
         switch ($Button) {
             'WPFTab2BT'                { Invoke-WPFTab $Button }
             'WPFAdvancedTabBT'          { Invoke-WPFTab $Button }
+            'WPFModeGuided'             { Select-WinUtilMode -Mode 'guided' }
+            'WPFModeAdvanced'           { Select-WinUtilMode -Mode 'advanced' }
+            'WPFGuidedYes'              { Submit-WinUtilGuidedAnswer -Answer $true }
+            'WPFGuidedNo'               { Submit-WinUtilGuidedAnswer -Answer $false }
+            'WPFGuidedBack'             { Step-WinUtilGuidedBack }
+            'WPFGuidedSummaryBack'      { Show-WinUtilGuidedQuestion -Index (@(Get-WinUtilGuidedQuestions).Count - 1) }
+            'WPFGuidedDoneAdvanced'     { Exit-WinUtilGuided }
+            'WPFGuidedReview'           { Invoke-WinUtilGuidedReview }
+            'WPFGuidedApply'            { Invoke-WinUtilGuidedApply }
+            'WPFGuidedDoneHome'         { Show-WinUtilModeChooser }
+            'WPFGuidedRestart'          { Restart-WinUtilComputer }
+            'WPFGuidedCloseWindow'      { if ($sync.GuidedWindow) { $sync.GuidedWindow.Close() } }
+            'WPFGuidedMinimizeWindow'   { if ($sync.GuidedWindow) { [Windows.SystemCommands]::MinimizeWindow($sync.GuidedWindow) } }
             'WPFDisableWindowsUpdate'   {
                 $prompt = if ($sync.Language -eq 'es') {
                     'Modo agresivo: APBOptimizer intentará detener Windows Update y renombrar WaaSMedicSvc.dll y wuaueng.dll (archivos protegidos del sistema). Esto bloquea actualizaciones, incluidas las de seguridad, y puede afectar la reparación de Windows. La restauración podría requerir intervención manual. ¿Continuar?'
@@ -7309,24 +8436,6 @@ function Invoke-WPFButton {
                     param($Mode)
                     try { Set-WinUtilWindowsUpdate -Mode $Mode }
                     finally { Update-WinUtilWindowsUpdateStatusUI }
-                }
-            }
-            'WPFDisableDefenderRealtime' {
-                $prompt = if ($sync.Language -eq 'es') {
-                    'Se desactivará temporalmente la protección en tiempo real de Microsoft Defender mediante PowerShell. Tu equipo quedará más expuesto al malware. Windows puede reactivarla automáticamente y la protección contra alteraciones puede bloquear la operación. Este ajuste no desinstala el antivirus. ¿Continuar?'
-                } else {
-                    'This will temporarily disable Microsoft Defender real-time protection through PowerShell, exposing your PC to malware. Windows may turn it back on automatically, and Tamper Protection may block the operation. This does not uninstall the antivirus. Continue?'
-                }
-                if ((Show-WinUtilMessage -Title 'Microsoft Defender' -Message $prompt -Button 'YesNo' -Icon 'Warning').ToString() -ne 'Yes') { return }
-                Start-WinUtilJob -Name 'Defender' -Description 'Temporarily disabling Defender real-time protection' -ScriptBlock {
-                    try { Set-WinUtilDefenderRealtime -Mode Disable }
-                    finally { Update-WinUtilDefenderRealtimeStatusUI }
-                }
-            }
-            'WPFEnableDefenderRealtime' {
-                Start-WinUtilJob -Name 'Defender' -Description 'Enabling Defender real-time protection' -ScriptBlock {
-                    try { Set-WinUtilDefenderRealtime -Mode Enable }
-                    finally { Update-WinUtilDefenderRealtimeStatusUI }
                 }
             }
             'WPFTweakHelpClose'         { $sync.WPFTweakHelpPopup.IsOpen = $false }
@@ -7743,7 +8852,6 @@ function Invoke-WPFTab {
         $sync.SearchBarClearButton.Visibility = [System.Windows.Visibility]::Collapsed
         if ($tabName -eq 'Advanced') {
             Update-WinUtilWindowsUpdateStatusUI
-            Update-WinUtilDefenderRealtimeStatusUI
         }
     }
 }
@@ -7810,7 +8918,7 @@ function Invoke-WPFtweaksbutton {
     # state. Generic processing would duplicate them and miss queued restores.
     $Tweaks = @($Tweaks | Where-Object {
       $parent = $sync.configs.tweaks.$_.ParentGroup
-      $parent -notin @('WPFServiceGroupDiagnostics', 'WPFDriverGroupOptional', 'WPFTaskGroupTelemetry')
+      $parent -notin @('WPFServiceGroupDiagnostics', 'WPFServiceGroupUseless', 'WPFDriverGroupOptional', 'WPFTaskGroupTelemetry')
     })
     $TaskChanges = @(Get-WinUtilPendingTaskChanges)
     $GroupChanges = @(Get-WinUtilPendingGroupChanges)
@@ -7869,6 +8977,15 @@ function Invoke-WPFtweaksbutton {
       'Disabling CPU mitigations (Spectre/Meltdown) weakens Windows protection against attacks that may leak data across processes. FPS gains are not guaranteed. Windows must be restarted. APBOptimizer will save the original settings for Undo. Continue?'
     }
     if ([string](Show-WinUtilMessage -Title 'APBOptimizer - CPU Mitigations' -Message $warning -Icon 'Warning' -Button 'YesNo') -ne 'Yes') { return }
+  }
+
+  if ($sync.Form -and $Tweaks -contains 'WPFTweaksDeBloat') {
+    $warning = if ($sync.Language -eq 'es') {
+      'ATENCION: se eliminaran numerosas aplicaciones de Microsoft Store de todos los usuarios y se quitara su aprovisionamiento para nuevas cuentas. La lista incluye Minecraft Bedrock, Gaming Services y aplicaciones instaladas por el usuario. Puedes perder datos de apps y juegos. NO existe restauracion automatica desde APBOptimizer; tendras que reinstalarlas manualmente. ¿Quieres continuar?'
+    } else {
+      'WARNING: This removes many Microsoft Store apps for all users and deprovisions them for new accounts. The list includes Minecraft Bedrock, Gaming Services and user-installed apps. App and game data may be lost. APBOptimizer CANNOT automatically undo this; you must reinstall affected apps manually. Continue?'
+    }
+    if ([string](Show-WinUtilMessage -Title 'APBOptimizer - MS Store Apps' -Message $warning -Icon 'Warning' -Button 'YesNo') -ne 'Yes') { return }
   }
 
   Write-WinUtilLog -Component "Tweaks" -Message "Tweaks requested: $(@($Tweaks).Count) tweak(s), $($TaskChanges.Count) scheduled-task change(s), $($GroupChanges.Count) service/driver change(s), DNS provider: $dnsProvider"
@@ -7933,6 +9050,9 @@ function Invoke-WPFtweaksbutton {
       }
       $completedSteps++
       Step-WinUtilJob -Percent ([int](($completedSteps / $totalSteps) * 100))
+    }
+    if (Test-WinUtilUIAlive) {
+      Update-WinUtilServiceGroupState
     }
   }
 }
@@ -8187,7 +9307,7 @@ function Invoke-WPFUIElements {
                         } elseif ($isDriverGroup) {
                             "Select eligible drivers; changes run only when you click Apply Tweaks. Review each driver's impact and reboot. $($entryInfo.Description)"
                         } else { "Select services to disable or restore when you click Apply Tweaks. $($entryInfo.Description)" }
-                        $master.Tag = @{ Children = [string[]]@($entryInfo.Children); Updating = $false; IsDriverGroup = $isDriverGroup; IsTaskGroup = $isTaskGroup; NoManageableDrivers = $false; UnavailableMessage = '' }
+                        $master.Tag = @{ Children = [string[]]@($entryInfo.Children); Updating = $false; IsDriverGroup = $isDriverGroup; IsTaskGroup = $isTaskGroup; NoManageableDrivers = $false; AllAlreadyDisabled = $false; UnavailableMessage = '' }
                         [System.Windows.Automation.AutomationProperties]::SetName($master, $entryInfo.Content)
                         $header.Children.Add($master) | Out-Null
 
@@ -8227,9 +9347,9 @@ function Invoke-WPFUIElements {
                                 $sync.ToggleStatusCache = @{}
                             }
                         }
-                        $driverMissingCount = 0
-                        $driverAlreadyDisabledCount = 0
-                        $driverProtectedCount = 0
+                        $driverMissingNames = [System.Collections.Generic.List[string]]::new()
+                        $driverAlreadyDisabledNames = [System.Collections.Generic.List[string]]::new()
+                        $driverProtectedNames = [System.Collections.Generic.List[string]]::new()
                         foreach ($childKey in @($entryInfo.Children)) {
                             $childConfig = $configHashtable[$childKey]
                             $childLocale = Get-WinUtilLocalizedEntry -Key $childKey
@@ -8294,17 +9414,19 @@ function Invoke-WPFUIElements {
                             if ($isDriverGroup) {
                                 $driverInfo = Get-WinUtilOptionalDriverInfo -Name $childConfig.driver.Name
                                 if (-not $driverInfo.Present) {
-                                    $driverMissingCount++
+                                    $driverMissingNames.Add($childConfig.driver.Name)
                                     $childToggle.IsEnabled = $false
                                     $childToggle.Visibility = [Windows.Visibility]::Collapsed
                                 } elseif (-not $driverInfo.CanChange) {
+                                    $reason = $driverInfo.Reason
                                     if ($driverInfo.Disabled -and -not $driverInfo.Managed) {
-                                        $driverAlreadyDisabledCount++
+                                        $driverAlreadyDisabledNames.Add($childConfig.driver.Name)
+                                        if ($sync.Language -eq 'es') { $reason = 'Ya estaba desactivado fuera de APBOptimizer; no hay un modo de inicio original guardado para reactivarlo.' }
                                     } else {
-                                        $driverProtectedCount++
+                                        $driverProtectedNames.Add($childConfig.driver.Name)
                                     }
                                     $childToggle.IsEnabled = $false
-                                    $childToggle.ToolTip = "$($childToggle.ToolTip) $($driverInfo.Reason)"
+                                    $childToggle.ToolTip = "$($childToggle.ToolTip) $reason"
                                 }
                             } elseif (-not $isTaskGroup -and -not (Get-Service -Name $childConfig.service[0].Name -ErrorAction SilentlyContinue)) {
                                 $childToggle.IsEnabled = $false
@@ -8366,14 +9488,33 @@ function Invoke-WPFUIElements {
                                 $sync[$_].Visibility -eq [Windows.Visibility]::Visible
                             }).Count
                             if ($manageable -eq 0) {
-                                $explanation = if ($sync.Language -eq 'es') {
-                                    "No hay drivers disponibles para cambiar. Ya desactivados fuera de APBOptimizer: $driverAlreadyDisabledCount. No instalados: $driverMissingCount. Otros protegidos: $driverProtectedCount. APBOptimizer no conoce el inicio anterior de los ya desactivados y no puede restaurarlos con seguridad."
-                                } else {
-                                    "No drivers can be changed. Already disabled outside APBOptimizer: $driverAlreadyDisabledCount. Not installed: $driverMissingCount. Other protected drivers: $driverProtectedCount. APBOptimizer cannot safely restore already-disabled drivers without a backup of their original startup mode."
+                                $isSpanish = ($sync.Language -eq 'es')
+                                # One line per non-empty category, naming the drivers.
+                                $lines = @(if ($isSpanish) { 'No hay nada que aplicar en este grupo.' } else { 'There is nothing to apply in this group.' })
+                                foreach ($category in @(
+                                    @{ Names = $driverAlreadyDisabledNames; Label = $(if ($isSpanish) { 'Ya desactivados' } else { 'Already disabled' }) },
+                                    @{ Names = $driverMissingNames; Label = $(if ($isSpanish) { 'No instalados' } else { 'Not installed' }) },
+                                    @{ Names = $driverProtectedNames; Label = $(if ($isSpanish) { 'Protegidos' } else { 'Protected' }) }
+                                )) {
+                                    if ($category.Names.Count -gt 0) {
+                                        $lines += "$($category.Label) ($($category.Names.Count)): $($category.Names -join ', ')."
+                                    }
                                 }
+                                if ($driverAlreadyDisabledNames.Count -gt 0) {
+                                    $lines += if ($isSpanish) {
+                                        "`nLos desactivó otra herramienta, una versión anterior de APBOptimizer o un cambio manual, así que no hay un modo de inicio original guardado. APBOptimizer no lo adivina y no puede reactivarlos. Para reactivar uno, usa un punto de restauración anterior al cambio o reinstala el programa que lo instaló."
+                                    } else {
+                                        "`nThey were disabled by another tool, an older APBOptimizer version or by hand, so no original startup mode was saved. APBOptimizer will not guess it and cannot re-enable them. To re-enable one, use a restore point from before the change or reinstall the program that installed it."
+                                    }
+                                }
+                                $explanation = Convert-WinUtilTextEncoding -Text ($lines -join "`n")
+                                $allAlreadyDisabled = ($driverAlreadyDisabledNames.Count -gt 0 -and $driverProtectedNames.Count -eq 0)
                                 $master.Tag.NoManageableDrivers = $true
+                                $master.Tag.AllAlreadyDisabled = $allAlreadyDisabled
                                 $master.Tag.UnavailableMessage = $explanation
-                                $master.Content = if ($sync.Language -eq 'es') {
+                                $master.Content = if ($allAlreadyDisabled) {
+                                    if ($isSpanish) { "$($entryInfo.Content) (ya desactivados)" } else { "$($entryInfo.Content) (already disabled)" }
+                                } elseif ($isSpanish) {
                                     "$($entryInfo.Content) (0 disponibles)"
                                 } else {
                                     "$($entryInfo.Content) (0 available)"
@@ -8400,6 +9541,11 @@ function Invoke-WPFUIElements {
                         })
                         $master.Add_Unchecked({
                             if ($this.Tag.Updating) { return }
+                            if ($this.Tag.NoManageableDrivers) {
+                                Show-WinUtilMessage -Title 'APBOptimizer - Drivers' -Message $this.Tag.UnavailableMessage -Icon 'Information' -Button 'OK' | Out-Null
+                                Update-WinUtilServiceGroupMaster -GroupName $this.Name
+                                return
+                            }
                             $this.Tag.Updating = $true
                             try {
                                 foreach ($childKey in @($this.Tag.Children)) {
@@ -9010,11 +10156,24 @@ function Invoke-WPFundoall {
 
     #>
 
-    $tweaks = $sync.selectedTweaks
+    $tweaks = @($sync.selectedTweaks)
 
     if ($tweaks.count -eq 0) {
         Show-WinUtilMessage -Message "Please check the tweaks you wish to undo." -Title "WinUtil" -Button "OK" -Icon "Warning"
         return
+    }
+
+    # AppX packages do not have an inverse action: Undo must not falsely report
+    # that a bulk uninstall was reversed. Other selected tweaks are still undoable.
+    if ($tweaks -contains 'WPFTweaksDeBloat') {
+        $warning = if ($sync.Language -eq 'es') {
+            'Eliminar apps de Microsoft Store no se puede deshacer automaticamente. Debes reinstalar las aplicaciones manualmente. Los otros ajustes seleccionados se pueden restaurar por separado.'
+        } else {
+            'Bulk Microsoft Store app removal has no automatic Undo. You must reinstall removed apps manually. Other selected tweaks can still be restored.'
+        }
+        Show-WinUtilMessage -Message $warning -Title 'APBOptimizer - MS Store Apps' -Button 'OK' -Icon 'Warning' | Out-Null
+        $tweaks = @($tweaks | Where-Object { $_ -ne 'WPFTweaksDeBloat' })
+        if ($tweaks.Count -eq 0) { return }
     }
 
     Start-WinUtilJob -Name "Undo tweaks" -Description "Undoing tweaks" -Parameters @{
@@ -9128,9 +10287,13 @@ $sync.configs.es = @'
                               "Description":  "Configura varios servicios para inicio manual o deshabilitado y ajusta SvcHostSplitThresholdInKB según la memoria del equipo. Puede reducir significativamente la cantidad de procesos svchost.exe."
                           },
     "WPFServiceGroupDiagnostics":  {
-                                       "Content":  "Desactivar servicios innecesarios",
-                                       "Description":  "Despliega la flecha para elegir servicios de Windows. Marcar o desmarcar solo prepara los cambios; pulsa Aplicar ajustes para desactivar los seleccionados o restaurar los desmarcados. La casilla principal selecciona todos los disponibles. Algunos servicios son importantes para diagnósticos, administración de dispositivos o redes .NET. NetTcpPortSharing suele venir desactivado de fábrica; restaurarlo lo pone en inicio manual."
+                                       "Content":  "Desactivar servicios de diagnóstico",
+                                       "Description":  "Despliega la flecha para elegir servicios de diagnóstico y telemetría de Windows: hosts de diagnóstico, Servicio de directivas de diagnóstico, DiagTrack, Informe de errores y el recopilador de Diagnostics Hub. Marcar o desmarcar solo prepara los cambios; pulsa Aplicar ajustes para desactivar los seleccionados o restaurar los desmarcados. La casilla principal selecciona todos los disponibles. Al desactivarlos dejan de funcionar los solucionadores de problemas, la detección de problemas y los informes de errores."
                                    },
+    "WPFServiceGroupUseless":  {
+                                   "Content":  "Desactivar servicios innecesarios",
+                                   "Description":  "Despliega la flecha para elegir servicios opcionales de Windows. Marcar o desmarcar solo prepara los cambios; pulsa Aplicar ajustes para desactivar los seleccionados o restaurar los desmarcados. La casilla principal selecciona todos los disponibles. Algunos servicios son importantes para la reproducción automática, la administración de dispositivos o las redes .NET. NetTcpPortSharing suele venir desactivado de fábrica; restaurarlo lo pone en inicio manual."
+                               },
     "WPFToggleServiceWdiSystemHost":  {
                                           "Content":  "Host de diagnóstico del sistema (WdiSystemHost)",
                                           "Description":  "Lo utiliza el servicio de directivas de diagnóstico de Windows para resolver problemas del sistema. Desactivarlo impide algunos diagnósticos. Revertir restaura el inicio manual."
@@ -9191,6 +10354,10 @@ $sync.configs.es = @'
                                           "Content":  "Indexación de Windows Search: desactivar",
                                           "Description":  "Detiene el servicio Windows Search (WSearch) y desactiva su inicio. Reduce la indexación en segundo plano, pero puede ralentizar o impedir las búsquedas de archivos, Inicio y Outlook. Revertir restaura el inicio automático diferido y vuelve a iniciar el servicio."
                                       },
+    "WPFTweaksDisableSearchWebView2":  {
+                                           "Content":  "Procesos WebView2 de la búsqueda de Inicio: desactivar [reinicio]",
+                                           "Description":  "Evita que SearchHost.exe mantenga procesos msedgewebview2.exe abiertos en segundo plano. Escribe en el Registro el mismo cambio que \u0027vivetool /disable /id:37926450\u0027 (SearchWebView2), sin ejecutar ViVeTool. También desactiva la nueva interfaz de búsqueda del menú Inicio. Microsoft puede renombrar o quitar esta función en una actualización y entonces el cambio deja de tener efecto. Requiere reiniciar. Revertir quita el cambio."
+                                       },
     "WPFDriverGroupOptional":  {
                                    "Content":  "Desactivar drivers innecesarios",
                                    "Description":  "Opciones avanzadas: marcar o desmarcar solo prepara los cambios. Pulsa Aplicar ajustes para realizarlos; antes de desactivar drivers aparece una confirmación. Se guarda la configuración original para restaurarla y se requiere reiniciar. Los drivers Boot/System y críticos están protegidos y los ausentes se ocultan. No se borran archivos .sys. Puede afectar DRM, red y energía; UCPD.sys tiene un ajuste independiente."
@@ -9283,6 +10450,10 @@ $sync.configs.es = @'
                                             "Content":  "Power Throttling: desactivar [reinicio recomendado]",
                                             "Description":  "Desactiva la limitación de energía de procesos en Windows 10 y 11 estableciendo PowerThrottlingOff=1 en el Registro. Puede beneficiar tareas que Windows limita en segundo plano, pero normalmente no mejora los FPS de juegos en primer plano. Puede aumentar consumo, temperatura, ruido del ventilador y gasto de batería. Requiere administrador; se recomienda reiniciar. No modifica el plan de energía ni otros ajustes de CPU. Guarda el valor original, incluso si no existía, para restaurarlo con Deshacer ajustes seleccionados. Una directiva del sistema puede volver a configurar este valor."
                                         },
+    "WPFTweaksDisableDevicePowerSaving":  {
+                                              "Content":  "Suspensión selectiva de USB y ahorro de PCIe: desactivar",
+                                              "Description":  "Ajuste del plan de energía de Windows 10 y 11. Usa powercfg para desactivar la suspensión selectiva de USB y la administración de energía del estado de vínculos de PCI Express (ASPM) con el equipo enchufado (AC) en el plan activo, y luego vuelve a activar el plan. Puede reducir cortes del mouse, mando o audio USB y la latencia de PCIe; la mejora no está garantizada. No cambia los valores con batería (DC) ni otros planes. El consumo y la temperatura en reposo pueden subir un poco. Requiere administrador; no hace falta reiniciar. Guarda los valores AC originales y el GUID del plan para restaurarlos con Deshacer ajustes seleccionados."
+                                          },
     "WPFTweaksDisableCPUMitigations":  {
                                            "Content":  "Disable Mitigations (Spectre/Meltdown) [reinicio]",
                                            "Description":  "Desactiva mitigaciones del sistema operativo contra ataques de ejecución especulativa, entre ellos Spectre variante 2 y Meltdown. Establece FeatureSettingsOverride=3 y FeatureSettingsOverrideMask=3 según el script CPU_Mitigations.bat y la documentación de Microsoft. No desactiva todas las protecciones del procesador ni del firmware. Reduce considerablemente la seguridad, sobre todo al ejecutar software no confiable. La mejora de rendimiento no está garantizada. Requiere administrador y reiniciar Windows. Guarda ambos valores originales del Registro (incluso si no existían) para restaurarlos con Deshacer ajustes seleccionados. No ejecuta ningún programa externo."
@@ -9407,6 +10578,10 @@ $sync.configs.es = @'
                                    "Content":  "Aplicaciones en segundo plano: desactivar",
                                    "Description":  "Impide que las aplicaciones de Microsoft Store se ejecuten en segundo plano. En Windows 11, normalmente hay que configurarlas por separado."
                                },
+    "WPFTweaksDeBloat":  {
+                             "Content":  "Eliminar apps de Microsoft Store - NO RECOMENDADO",
+                             "Description":  "Elimina para todos los usuarios una lista de aplicaciones de Microsoft Store usada por WinUtil y evita que se instalen automáticamente en cuentas nuevas. Incluye Minecraft Bedrock, Gaming Services, apps multimedia, de comunicación y algunas apps de terceros si están instaladas. No elimina absolutamente todas las apps: conserva Microsoft Store y los componentes esenciales. No tiene restauración automática; tendrás que reinstalar las aplicaciones y juegos por separado y podrías perder datos."
+                         },
     "WPFTweaksDisableExplorerAutoDiscovery":  {
                                                   "Content":  "Detección de carpetas: desactivar",
                                                   "Description":  "Impide que el Explorador adivine el tipo de carpeta según sus archivos, lo que puede ralentizar la navegación. ¡Atención! También desactiva la agrupación de archivos."
@@ -9517,6 +10692,22 @@ $sync.configs.es = @'
                               "Content":  "Modo Juego",
                               "Description":  "Activa o desactiva el Modo Juego, que da prioridad al rendimiento de los juegos al asignar recursos del sistema."
                           },
+    "WPFToggleGameDVR":  {
+                             "Content":  "Grabación en segundo plano (Game DVR)",
+                             "Description":  "Activa o desactiva la captura en segundo plano de Xbox Game Bar (Grabar lo que ha sucedido). Al desactivarla se evita codificar vídeo continuamente mientras juegas. No elimina las capturas de pantalla ni la grabación manual."
+                         },
+    "WPFToggleHAGS":  {
+                          "Content":  "Programación de GPU acelerada por hardware",
+                          "Description":  "Activa o desactiva que la tarjeta gráfica gestione su propia programación (HwSchMode). Requiere GPU y driver WDDM 2.7 o superior y reiniciar. El resultado depende de la GPU y del juego; Windows lo ignora en hardware no compatible."
+                      },
+    "WPFToggleGamingMultimediaProfile":  {
+                                             "Content":  "Perfil multimedia para juegos",
+                                             "Description":  "Activa o desactiva el perfil de sistema de MMCSS: reserva un 10 % de CPU para tareas en segundo plano en lugar del 20 % (SystemResponsiveness) y desactiva la limitación de red multimedia (NetworkThrottlingIndex 0xFFFFFFFF). Al desactivarlo se restauran los valores de Windows, 20 y 10. No garantiza más FPS."
+                                         },
+    "WPFToggleFastStartup":  {
+                                 "Content":  "Inicio rápido",
+                                 "Description":  "Activa o desactiva el Inicio rápido (HiberbootEnabled). Al desactivarlo, Apagar realiza un apagado completo y los drivers y el kernel arrancan limpios; el arranque puede tardar unos segundos más. No tiene efecto si la hibernación está desactivada."
+                             },
     "WPFToggleLongPaths":  {
                                "Content":  "Rutas de archivos largas: activar",
                                "Description":  "Activa o desactiva la compatibilidad con rutas de archivos de más de 260 caracteres en el Explorador."
@@ -9552,6 +10743,1045 @@ $sync.configs.es = @'
                        "Customize Preferences":  "Personalizar preferencias",
                        "Performance Plans - NOT FOR LAPTOPS":  "Planes de energía - NO PARA PORTÁTILES"
                    }
+}
+'@ | ConvertFrom-Json
+$sync.configs.guided = @'
+{
+    "Questions":  [
+                      {
+                          "Id":  "RestorePoint",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Before you start",
+                                           "es":  "Antes de empezar"
+                                       },
+                          "Title":  {
+                                        "en":  "Create a restore point before applying the changes?",
+                                        "es":  "¿Crear un punto de restauración antes de aplicar los cambios?"
+                                    },
+                          "Body":  {
+                                       "en":  "If something does not work as expected, you can roll Windows back to today\u0027s state from System Restore.",
+                                       "es":  "Si algo no funciona como esperabas, podrás volver Windows al estado de hoy desde Restaurar sistema."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Turns System Restore on for the system drive when it has no restore points yet.",
+                                                     "Removes the Windows limit of one restore point every 24 hours.",
+                                                     "The point is created before any other guided change."
+                                                 ],
+                                          "es":  [
+                                                     "Activa Restaurar sistema en la unidad del sistema si todavía no tiene puntos de restauración.",
+                                                     "Quita el límite de Windows de un punto de restauración cada 24 horas.",
+                                                     "El punto se crea antes que cualquier otro cambio del modo guiado."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "To roll back later, search Start for \"Create a restore point\" and open System Restore.",
+                                       "es":  "Para volver atrás, busca \"Crear un punto de restauración\" en Inicio y abre Restaurar sistema."
+                                   },
+                          "Summary":  {
+                                          "en":  "Create a restore point",
+                                          "es":  "Crear punto de restauración"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Yes, create it",
+                                           "es":  "Sí, crearlo"
+                                       },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksRestorePoint"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "Telemetry",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Privacy",
+                                           "es":  "Privacidad"
+                                       },
+                          "Title":  {
+                                        "en":  "Cut Windows telemetry and promotions?",
+                                        "es":  "¿Cortar la telemetría y las promociones de Windows?"
+                                    },
+                          "Body":  {
+                                       "en":  "Windows sends usage data to Microsoft and installs or suggests apps on its own. Each option is separate: clear the ones you want to keep.",
+                                       "es":  "Windows envía datos de uso a Microsoft e instala o sugiere apps por su cuenta. Cada opción es independiente: desmarca las que quieras conservar."
+                                   },
+                          "Summary":  {
+                                          "en":  "Privacy",
+                                          "es":  "Privacidad"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Next",
+                                           "es":  "Siguiente"
+                                       },
+                          "NoLabel":  {
+                                          "en":  "None",
+                                          "es":  "Ninguna"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Options":  [
+                                          {
+                                              "Id":  "Telemetry",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Turn off telemetry and promoted apps",
+                                                            "es":  "Desactivar telemetría y apps promocionadas"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Diagnostic data at the minimum level, no advertising ID, no typing and voice data collection and no feedback prompts. Disables DiagTrack and error reporting, stops automatic Defender sample submission and stops Windows from installing promoted apps.",
+                                                             "es":  "Datos de diagnóstico al mínimo, sin ID de publicidad, sin recopilar lo que escribes o dictas y sin encuestas de opinión. Deshabilita DiagTrack y el informe de errores, frena el envío automático de muestras de Defender y evita que Windows instale apps promocionadas."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTweaksTelemetry"
+                                                              },
+                                                              {
+                                                                  "Key":  "WPFTweaksConsumerFeatures"
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "TelemetryTasks",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Turn off telemetry scheduled tasks",
+                                                            "es":  "Desactivar tareas programadas de telemetría"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Compatibility Appraiser, ProgramDataUpdater, the Customer Experience Improvement Program tasks, UsageDataReporting and SustainabilityTelemetry. Their state is saved so they can be restored.",
+                                                             "es":  "Compatibility Appraiser, ProgramDataUpdater, las tareas del Programa de mejora de la experiencia del cliente, UsageDataReporting y SustainabilityTelemetry. Se guarda su estado para poder restaurarlas."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTaskGroupTelemetry",
+                                                                  "Members":  [
+                                                                                  "WPFToggleTaskCompatibilityAppraiser",
+                                                                                  "WPFToggleTaskProgramDataUpdater",
+                                                                                  "WPFToggleTaskConsolidator",
+                                                                                  "WPFToggleTaskUsbCeip",
+                                                                                  "WPFToggleTaskKernelCeip",
+                                                                                  "WPFToggleTaskCompatibilityAppraiserExp",
+                                                                                  "WPFToggleTaskUsageDataReporting",
+                                                                                  "WPFToggleTaskSustainabilityTelemetry"
+                                                                              ]
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "DeliveryOptimization",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Turn off Delivery Optimization",
+                                                            "es":  "Desactivar Optimización de distribución"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Windows stops uploading updates to other PCs on the Internet or your network. Updates still download normally.",
+                                                             "es":  "Windows deja de subir actualizaciones a otras PCs de Internet o de tu red. Las actualizaciones se siguen descargando normal."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTweaksDeliveryOptimization"
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "VendorSoftware",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Block vendor software installs",
+                                                            "es":  "Bloquear software de fabricantes"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Blocks programs the PC vendor runs from the firmware (WPBT), companion apps Windows downloads when you plug in devices and Logi Download Assistant. Devices keep working. If you use the vendor\u0027s anti-theft software, clear this option.",
+                                                             "es":  "Bloquea programas que el fabricante ejecuta desde el firmware (WPBT), las apps que Windows descarga al conectar dispositivos y Logi Download Assistant. Los dispositivos siguen funcionando. Si usas el antirrobo del fabricante, desmarca esta opción."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTweaksWPBT"
+                                                              },
+                                                              {
+                                                                  "Key":  "WPFTweaksPreventDeviceMetadataFromNetwork"
+                                                              },
+                                                              {
+                                                                  "Key":  "WPFTweaksLogiBlock"
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "StartRecommendations",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Hide Start recommendations",
+                                                            "es":  "Ocultar recomendaciones de Inicio"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Hides the Recommended section of Start and suggested Store apps when you search. It also turns off Windows Spotlight on the lock screen. Explorer restarts once.",
+                                                             "es":  "Oculta la sección Recomendado del menú Inicio y las apps sugeridas de la Store al buscar. También apaga Windows Spotlight en la pantalla de bloqueo. El Explorador se reinicia una vez."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFToggleStartMenuRecommendations",
+                                                                  "State":  false
+                                                              },
+                                                              {
+                                                                  "Key":  "WPFTweaksDisableStoreSearch"
+                                                              }
+                                                          ]
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "BackgroundApps",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Performance",
+                                           "es":  "Rendimiento"
+                                       },
+                          "Title":  {
+                                        "en":  "Stop Store apps from running in the background?",
+                                        "es":  "¿Impedir que las apps de la Store funcionen en segundo plano?"
+                                    },
+                          "Body":  {
+                                       "en":  "Fewer processes and less memory use while you play. Some apps may send notifications only while they are open.",
+                                       "es":  "Menos procesos y memoria en uso mientras juegas. Algunas apps pueden avisar solo mientras están abiertas."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Blocks background execution of every Store app for your user.",
+                                                     "Classic programs such as Steam, Discord or driver tools are not affected.",
+                                                     "Apps such as Mail, Phone Link or Xbox stop syncing and notifying while closed."
+                                                 ],
+                                          "es":  [
+                                                     "Bloquea para tu usuario la ejecución en segundo plano de todas las apps de la Store.",
+                                                     "No afecta a programas clásicos como Steam, Discord o las herramientas de los drivers.",
+                                                     "Apps como Correo, Vincular teléfono o Xbox dejan de sincronizar y avisar mientras están cerradas."
+                                                 ]
+                                      },
+                          "Summary":  {
+                                          "en":  "Turn off background Store apps",
+                                          "es":  "Desactivar apps de la Store en segundo plano"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisableBGapps"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "VisualEffects",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Performance",
+                                           "es":  "Rendimiento"
+                                       },
+                          "Title":  {
+                                        "en":  "Set visual effects for best performance?",
+                                        "es":  "¿Ajustar los efectos visuales para el máximo rendimiento?"
+                                    },
+                          "Body":  {
+                                       "en":  "Removes animations, shadows and transparency from windows and menus. On modest PCs Windows feels faster; on powerful PCs the difference is small.",
+                                       "es":  "Quita animaciones, sombras y transparencias de ventanas y menús. En PCs modestas Windows se siente más rápido; en PCs potentes la diferencia es pequeña."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "No animations when minimizing and maximizing windows or on the taskbar.",
+                                                     "Windows show only their outline while you drag them.",
+                                                     "No shadows or translucent selection in Explorer, and no Aero Peek.",
+                                                     "Menus open faster (200 ms instead of 400 ms) and key repeat starts sooner.",
+                                                     "Hides Search, Task View and Chat from the taskbar."
+                                                 ],
+                                          "es":  [
+                                                     "Sin animaciones al minimizar y maximizar ventanas ni en la barra de tareas.",
+                                                     "Las ventanas muestran solo su contorno mientras las arrastras.",
+                                                     "Sin sombras ni selección translúcida en el Explorador, y sin Aero Peek.",
+                                                     "Los menús abren más rápido (200 ms en lugar de 400 ms) y la repetición de teclas empieza antes.",
+                                                     "Oculta Buscar, Vista de tareas y Chat de la barra de tareas."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Some effects change only after you sign out or restart.",
+                                       "es":  "Algunos efectos cambian recién al cerrar sesión o reiniciar."
+                                   },
+                          "Summary":  {
+                                          "en":  "Visual effects for best performance",
+                                          "es":  "Efectos visuales para máximo rendimiento"
+                                      },
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisplay"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "Services",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Services",
+                                           "es":  "Servicios"
+                                       },
+                          "Title":  {
+                                        "en":  "Which services should we adjust?",
+                                        "es":  "¿Qué servicios ajustamos?"
+                                    },
+                          "Body":  {
+                                       "en":  "Windows starts many services that most PCs never use. Each group is separate: switch off the ones you want to leave as they are.",
+                                       "es":  "Windows arranca muchos servicios que la mayoría de las PCs no usa. Cada grupo es independiente: apaga los que quieras dejar como están."
+                                   },
+                          "Note":  {
+                                       "en":  "Services you changed yourself are left alone, and only services installed on this PC are touched. Everything can be undone from advanced mode.",
+                                       "es":  "Los servicios que cambiaste tú se dejan como están y solo se tocan los que están instalados en esta PC. Todo se puede deshacer desde el modo avanzado."
+                                   },
+                          "Summary":  {
+                                          "en":  "Services",
+                                          "es":  "Servicios"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Next",
+                                           "es":  "Siguiente"
+                                       },
+                          "NoLabel":  {
+                                          "en":  "None",
+                                          "es":  "Ninguno"
+                                      },
+                          "OptionStyle":  "Toggle",
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Options":  [
+                                          {
+                                              "Id":  "ServicesManual",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Windows services to Manual",
+                                                            "es":  "Servicios de Windows en Manual"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "MapsBroker and StorSvc go to Manual; Offline Files (CscService), telemetry (DiagTrack) and Internet Connection Sharing (SharedAccess) are disabled. Fewer svchost.exe processes, based on your RAM. If you share this PC\u0027s Internet connection, switch this off.",
+                                                             "es":  "MapsBroker y StorSvc pasan a Manual; Archivos sin conexión (CscService), telemetría (DiagTrack) y Conexión compartida a Internet (SharedAccess) quedan deshabilitados. Menos procesos svchost.exe según tu RAM. Si compartes la conexión a Internet de esta PC, apágalo."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTweaksServices"
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "DiagnosticServices",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Disable diagnostic services",
+                                                            "es":  "Desactivar servicios de diagnóstico"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Diagnostic hosts (WdiSystemHost, WdiServiceHost), Diagnostic Policy Service (DPS), DiagTrack, Windows Error Reporting (WerSvc) and the Diagnostics Hub Collector. Windows troubleshooters stop working.",
+                                                             "es":  "Hosts de diagnóstico (WdiSystemHost, WdiServiceHost), Servicio de directivas de diagnóstico (DPS), DiagTrack, Informe de errores (WerSvc) y Recopilador de diagnósticos. Los solucionadores de problemas de Windows dejan de funcionar."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFServiceGroupDiagnostics"
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "UselessServices",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Disable unneeded services",
+                                                            "es":  "Desactivar servicios innecesarios"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "AutoPlay (ShellHWDetection), Windows Media Player sharing, Windows Insider, Retail Demo, WPF Font Cache, Net.TCP Port Sharing, Windows Health and WAP Push. If a company manages this PC (Intune/MDM), switch this off.",
+                                                             "es":  "Reproducción automática (ShellHWDetection), uso compartido del Reproductor de Windows Media, Windows Insider, Demo de tienda, caché de fuentes WPF, Net.TCP, Windows Health y mensajes push WAP. Si tu PC la administra una empresa (Intune/MDM), apágalo."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFServiceGroupUseless"
+                                                              }
+                                                          ]
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "WidgetsAI",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Apps",
+                                           "es":  "Apps"
+                                       },
+                          "Title":  {
+                                        "en":  "Remove Widgets and Windows AI features (Copilot)?",
+                                        "es":  "¿Quitar los Widgets y las funciones de IA de Windows (Copilot)?"
+                                    },
+                          "Body":  {
+                                       "en":  "Removes the taskbar Widgets panel and the Copilot and AI packages, which run in the background.",
+                                       "es":  "Quita el panel de Widgets de la barra de tareas y los paquetes de Copilot e IA, que funcionan en segundo plano."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Removes the Widgets panel and its packages, then restarts Explorer.",
+                                                     "Removes Copilot and the Microsoft 365 (Office Hub) app.",
+                                                     "Turns off Recall and the Windows AI service (WSAIFabricSvc).",
+                                                     "Hides the AI components page in Settings and turns off AI features in Notepad."
+                                                 ],
+                                          "es":  [
+                                                     "Quita el panel de Widgets y sus paquetes, y reinicia el Explorador.",
+                                                     "Quita Copilot y la app Microsoft 365 (Office Hub).",
+                                                     "Desactiva Recall y el servicio de IA de Windows (WSAIFabricSvc).",
+                                                     "Oculta la página de componentes de IA en Configuración y apaga la IA del Bloc de notas."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Removed packages are not restored by Undo. You would have to reinstall them from the Microsoft Store.",
+                                       "es":  "Deshacer no reinstala los paquetes quitados. Tendrías que volver a instalarlos desde la Microsoft Store."
+                                   },
+                          "Summary":  {
+                                          "en":  "Remove Widgets and Windows AI",
+                                          "es":  "Quitar Widgets e IA de Windows"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  false,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksWidget"
+                                          },
+                                          {
+                                              "Key":  "WPFTweaksWindowsAI"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "Explorer",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Explorer and Windows 11",
+                                           "es":  "Explorador y Windows 11"
+                                       },
+                          "Title":  {
+                                        "en":  "Make Windows 11 more comfortable to use?",
+                                        "es":  "¿Hacer Windows 11 más cómodo de usar?"
+                                    },
+                          "Body":  {
+                                       "en":  "These changes are applied together. Clear the ones you do not want.",
+                                       "es":  "Aplicamos estos cambios juntos. Desmarca los que no quieras."
+                                   },
+                          "Summary":  {
+                                          "en":  "Explorer and Windows 11",
+                                          "es":  "Explorador y Windows 11"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Next",
+                                           "es":  "Siguiente"
+                                       },
+                          "NoLabel":  {
+                                          "en":  "None",
+                                          "es":  "Ninguno"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Options":  [
+                                          {
+                                              "Id":  "ClassicContextMenu",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Classic context menu",
+                                                            "es":  "Menú contextual clásico"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Right-click shows every option without going through \"Show more options\". Explorer restarts once.",
+                                                             "es":  "El clic derecho muestra todas las opciones sin pasar por \"Mostrar más opciones\". El Explorador se reinicia una vez."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTweaksRightClickMenu"
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "NoBingSearch",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Remove Bing from Start search",
+                                                            "es":  "Quitar Bing de la búsqueda de Inicio"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Start searches only your PC, without web results.",
+                                                             "es":  "Inicio busca solo en tu PC, sin resultados web."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFToggleBingSearch",
+                                                                  "State":  false
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "LongPaths",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Enable long file paths",
+                                                            "es":  "Activar rutas de archivos largas"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Allows paths longer than 260 characters. Useful for modded games and large projects.",
+                                                             "es":  "Permite rutas de más de 260 caracteres. Útil para juegos con mods y proyectos grandes."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFToggleLongPaths",
+                                                                  "State":  true
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "HiddenFiles",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "Show hidden files",
+                                                            "es":  "Mostrar archivos ocultos"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Folders such as AppData become visible in File Explorer.",
+                                                             "es":  "Ves carpetas como AppData en el Explorador."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFToggleHiddenFiles",
+                                                                  "State":  true
+                                                              }
+                                                          ]
+                                          },
+                                          {
+                                              "Id":  "EndTask",
+                                              "Default":  true,
+                                              "Label":  {
+                                                            "en":  "End task from the taskbar",
+                                                            "es":  "Finalizar tarea desde la barra de tareas"
+                                                        },
+                                              "Detail":  {
+                                                             "en":  "Right-clicking an open app in the taskbar shows \"End task\", without opening Task Manager.",
+                                                             "es":  "Al hacer clic derecho en una app abierta de la barra de tareas aparece \"Finalizar tarea\", sin abrir el Administrador de tareas."
+                                                         },
+                                              "Actions":  [
+                                                              {
+                                                                  "Key":  "WPFTweaksEndTaskOnTaskbar"
+                                                              }
+                                                          ]
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "GameDVR",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Gaming",
+                                           "es":  "Juegos"
+                                       },
+                          "Title":  {
+                                        "en":  "Turn off background recording (Game DVR)?",
+                                        "es":  "¿Desactivar la grabación en segundo plano (Game DVR)?"
+                                    },
+                          "Body":  {
+                                       "en":  "Windows can keep recording the last minutes of play all the time. If you do not use it, turning it off frees GPU and disk while you play.",
+                                       "es":  "Windows puede grabar los últimos minutos de juego todo el tiempo. Si no lo usas, desactivarlo libera GPU y disco mientras juegas."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Turns off \"Record what happened\" background capture in Xbox Game Bar.",
+                                                     "Turns off Game DVR in the Windows game settings.",
+                                                     "Xbox Game Bar itself stays installed."
+                                                 ],
+                                          "es":  [
+                                                     "Apaga la captura en segundo plano (\"Grabar lo que pasó\") de Xbox Game Bar.",
+                                                     "Apaga Game DVR en la configuración de juegos de Windows.",
+                                                     "Xbox Game Bar sigue instalada."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Screenshots and manual recording keep working.",
+                                       "es":  "Las capturas de pantalla y la grabación manual siguen funcionando."
+                                   },
+                          "Summary":  {
+                                          "en":  "Turn off Game DVR",
+                                          "es":  "Desactivar Game DVR"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Yes, turn it off",
+                                           "es":  "Sí, desactivar"
+                                       },
+                          "NoLabel":  {
+                                          "en":  "No, I use it",
+                                          "es":  "No, la uso"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFToggleGameDVR",
+                                              "State":  false
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "MultimediaProfile",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Gaming",
+                                           "es":  "Juegos"
+                                       },
+                          "Title":  {
+                                        "en":  "Use the multimedia profile for gaming?",
+                                        "es":  "¿Usar el perfil multimedia para juegos?"
+                                    },
+                          "Body":  {
+                                       "en":  "Windows reserves 10% of the CPU for background tasks instead of 20% and stops throttling network traffic during multimedia playback.",
+                                       "es":  "Windows reserva un 10 % de CPU para tareas en segundo plano en lugar del 20 % y deja de limitar la red durante la reproducción multimedia."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "SystemResponsiveness: 10 % reserved for background tasks (Windows uses 20 %).",
+                                                     "NetworkThrottlingIndex: off. Windows normally limits network packets while audio or video plays.",
+                                                     "It is a system-wide setting; no game file is changed."
+                                                 ],
+                                          "es":  [
+                                                     "SystemResponsiveness: 10 % reservado para tareas en segundo plano (Windows usa 20 %).",
+                                                     "NetworkThrottlingIndex: desactivado. Windows normalmente limita los paquetes de red mientras se reproduce audio o video.",
+                                                     "Es un ajuste de todo el sistema; no se modifica ningún archivo de juegos."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "FPS gains are not guaranteed.",
+                                       "es":  "No garantiza más FPS."
+                                   },
+                          "Summary":  {
+                                          "en":  "Multimedia profile for gaming",
+                                          "es":  "Perfil multimedia para juegos"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFToggleGamingMultimediaProfile",
+                                              "State":  true
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "PowerPlan",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Power",
+                                           "es":  "Energía"
+                                       },
+                          "Title":  {
+                                        "en":  "Turn on the Ultimate Performance power plan?",
+                                        "es":  "¿Activar el plan de energía Máximo rendimiento?"
+                                    },
+                          "Body":  {
+                                       "en":  "Windows stops lowering the processor speed and switching off hardware to save power, so the PC responds faster. It is meant for desktop PCs.",
+                                       "es":  "Windows deja de bajar la velocidad del procesador y de apagar partes del hardware para ahorrar energía, así la PC responde más rápido. Está pensado para PCs de escritorio."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Adds a copy of the Ultimate Performance plan and makes it the active plan.",
+                                                     "The processor keeps a high minimum speed and disks do not spin down.",
+                                                     "It is applied before the USB and PCIe power question, so that change lands on the new plan.",
+                                                     "To go back, choose another plan in Control Panel \u003e Power Options."
+                                                 ],
+                                          "es":  [
+                                                     "Agrega una copia del plan Máximo rendimiento y la deja como plan activo.",
+                                                     "El procesador mantiene una velocidad mínima alta y los discos no se apagan.",
+                                                     "Se aplica antes que el ahorro de energía de USB y PCIe, así ese cambio queda en el plan nuevo.",
+                                                     "Para volver, elige otro plan en Panel de control \u003e Opciones de energía."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Undo from advanced mode restores the default Windows power plans and deletes custom plans.",
+                                       "es":  "Deshacer desde el modo avanzado restablece los planes de energía de Windows y borra los planes personalizados."
+                                   },
+                          "Summary":  {
+                                          "en":  "Ultimate Performance power plan",
+                                          "es":  "Plan de energía Máximo rendimiento"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Yes, turn on",
+                                           "es":  "Sí, activar"
+                                       },
+                          "Advice":  "PowerPlan",
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFAddUltPerf"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "DevicePowerSaving",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Gaming",
+                                           "es":  "Juegos"
+                                       },
+                          "Title":  {
+                                        "en":  "Turn off USB and PCIe power saving?",
+                                        "es":  "¿Desactivar el ahorro de energía de USB y PCIe?"
+                                    },
+                          "Body":  {
+                                       "en":  "Can reduce mouse, controller or USB audio dropouts. Only applies while the PC is plugged in, in the active power plan.",
+                                       "es":  "Puede reducir cortes del mouse, el mando o el audio USB. Solo se aplica con el equipo enchufado, en el plan de energía activo."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "USB selective suspend: off while plugged in.",
+                                                     "PCI Express Link State Power Management: off while plugged in.",
+                                                     "Battery settings are not changed.",
+                                                     "The previous values are saved so Undo can restore them."
+                                                 ],
+                                          "es":  [
+                                                     "Suspensión selectiva de USB: desactivada con el equipo enchufado.",
+                                                     "Administración de energía del estado de vínculo PCI Express: desactivada con el equipo enchufado.",
+                                                     "La configuración con batería no se toca.",
+                                                     "Se guardan los valores anteriores para que Deshacer los restaure."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Power use at idle may increase slightly.",
+                                       "es":  "El consumo en reposo puede subir un poco."
+                                   },
+                          "Summary":  {
+                                          "en":  "Turn off USB and PCIe power saving",
+                                          "es":  "Desactivar ahorro de USB y PCIe"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisableDevicePowerSaving"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "HAGS",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Gaming",
+                                           "es":  "Juegos"
+                                       },
+                          "Title":  {
+                                        "en":  "Turn on hardware-accelerated GPU scheduling (HAGS)?",
+                                        "es":  "¿Activar la programación de GPU acelerada por hardware (HAGS)?"
+                                    },
+                          "Body":  {
+                                       "en":  "The graphics card manages its own work queue. It needs a recent GPU and driver; Windows ignores it on unsupported hardware.",
+                                       "es":  "La tarjeta gráfica gestiona su propia cola de trabajo. Requiere GPU y driver recientes; Windows lo ignora en hardware no compatible."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Same switch as Settings \u003e Display \u003e Graphics \u003e Hardware-accelerated GPU scheduling.",
+                                                     "Writes HwSchMode = 2 in the graphics driver settings.",
+                                                     "It takes effect after restarting."
+                                                 ],
+                                          "es":  [
+                                                     "Es el mismo interruptor de Configuración \u003e Pantalla \u003e Gráficos \u003e Programación de GPU acelerada por hardware.",
+                                                     "Escribe HwSchMode = 2 en la configuración de los drivers gráficos.",
+                                                     "Se activa después de reiniciar."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Results depend on the GPU and the game.",
+                                       "es":  "El resultado depende de la GPU y del juego."
+                                   },
+                          "Summary":  {
+                                          "en":  "Hardware-accelerated GPU scheduling",
+                                          "es":  "Programación de GPU acelerada (HAGS)"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  true,
+                          "Reboot":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFToggleHAGS",
+                                              "State":  true
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "TempFiles",
+                          "Section":  "basic",
+                          "Category":  {
+                                           "en":  "Cleanup",
+                                           "es":  "Limpieza"
+                                       },
+                          "Title":  {
+                                        "en":  "Delete temporary files?",
+                                        "es":  "¿Borrar los archivos temporales?"
+                                    },
+                          "Body":  {
+                                       "en":  "Empties the temporary folders of Windows and your user. Programs recreate what they need.",
+                                       "es":  "Vacía las carpetas temporales de Windows y de tu usuario. Los programas vuelven a crear lo que necesitan."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Empties %TEMP% and C:\\Windows\\Temp.",
+                                                     "Files in use are skipped.",
+                                                     "Deleted files do not go to the Recycle Bin."
+                                                 ],
+                                          "es":  [
+                                                     "Vacía %TEMP% y C:\\Windows\\Temp.",
+                                                     "Los archivos en uso se saltan.",
+                                                     "Los archivos borrados no van a la Papelera."
+                                                 ]
+                                      },
+                          "Summary":  {
+                                          "en":  "Delete temporary files",
+                                          "es":  "Borrar archivos temporales"
+                                      },
+                          "Recommended":  true,
+                          "Reversible":  false,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDeleteTempFiles"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "PauseUpdates",
+                          "Section":  "advanced",
+                          "Category":  {
+                                           "en":  "Advanced",
+                                           "es":  "Avanzado"
+                                       },
+                          "Title":  {
+                                        "en":  "Pause Windows Update until 2099?",
+                                        "es":  "¿Pausar Windows Update hasta 2099?"
+                                    },
+                          "Body":  {
+                                       "en":  "Stops Windows from updating and restarting the PC on its own. It only changes the pause dates in the registry: no services or Windows files are touched.",
+                                       "es":  "Evita que Windows se actualice solo y reinicie el equipo. Solo cambia las fechas de pausa en el Registro: no toca servicios ni archivos de Windows."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Writes pause dates until 2099 for quality, feature and general updates.",
+                                                     "The previous values are saved; Undo restores them.",
+                                                     "No service is disabled and no file is renamed."
+                                                 ],
+                                          "es":  [
+                                                     "Escribe fechas de pausa hasta 2099 para actualizaciones de calidad, de características y generales.",
+                                                     "Se guardan los valores anteriores; Deshacer los restaura.",
+                                                     "No se deshabilita ningún servicio ni se renombra ningún archivo."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "You will not receive security updates either. Microsoft only supports 35-day pauses, so Windows may ignore or reset the date.",
+                                       "es":  "Tampoco recibirás actualizaciones de seguridad. Microsoft solo admite pausas de 35 días, así que Windows puede ignorar la fecha o reiniciarla."
+                                   },
+                          "Summary":  {
+                                          "en":  "Pause Windows Update until 2099",
+                                          "es":  "Pausar Windows Update hasta 2099"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Yes, pause",
+                                           "es":  "Sí, pausar"
+                                       },
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksPauseWindows2099"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "WindowsSearch",
+                          "Section":  "advanced",
+                          "Category":  {
+                                           "en":  "Advanced",
+                                           "es":  "Avanzado"
+                                       },
+                          "Title":  {
+                                        "en":  "Turn off Windows Search indexing?",
+                                        "es":  "¿Desactivar la indexación de Windows Search?"
+                                    },
+                          "Body":  {
+                                       "en":  "Stops the Windows Search service from indexing files in the background, which reduces disk and CPU use.",
+                                       "es":  "Detiene el servicio Windows Search para que no indexe archivos en segundo plano, lo que reduce el uso de disco y CPU."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Windows Search service (WSearch): stopped and disabled.",
+                                                     "Undo sets it back to Automatic (delayed start).",
+                                                     "Search still works, but it scans the disk each time instead of using the index."
+                                                 ],
+                                          "es":  [
+                                                     "Servicio Windows Search (WSearch): detenido y deshabilitado.",
+                                                     "Deshacer lo vuelve a Automático (inicio retrasado).",
+                                                     "La búsqueda sigue funcionando, pero recorre el disco cada vez en lugar de usar el índice."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "File, Start and Outlook searches can become slow or stop finding results.",
+                                       "es":  "Las búsquedas de archivos, de Inicio y de Outlook pueden volverse lentas o dejar de encontrar resultados."
+                                   },
+                          "Summary":  {
+                                          "en":  "Turn off Windows Search indexing",
+                                          "es":  "Desactivar indexación de Windows Search"
+                                      },
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisableWindowsSearch"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "SearchWebView2",
+                          "Section":  "advanced",
+                          "Category":  {
+                                           "en":  "Background processes",
+                                           "es":  "Procesos en segundo plano"
+                                       },
+                          "Title":  {
+                                        "en":  "Stop Start search from keeping WebView2 open in the background?",
+                                        "es":  "¿Evitar que la búsqueda de Inicio deje WebView2 abierto en segundo plano?"
+                                    },
+                          "Body":  {
+                                       "en":  "SearchHost.exe keeps several msedgewebview2.exe processes open to draw the Start search panel, even when you are not searching.",
+                                       "es":  "SearchHost.exe mantiene abiertos varios procesos msedgewebview2.exe para dibujar el panel de búsqueda de Inicio, aunque no estés buscando."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "The msedgewebview2.exe processes of Start search stop running in the background.",
+                                                     "Start search goes back to the previous interface.",
+                                                     "It takes effect after restarting; Undo brings everything back."
+                                                 ],
+                                          "es":  [
+                                                     "Los procesos msedgewebview2.exe de la búsqueda de Inicio dejan de correr en segundo plano.",
+                                                     "La búsqueda de Inicio vuelve a la interfaz anterior.",
+                                                     "Se aplica después de reiniciar; Deshacer vuelve todo como estaba."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "A Windows update can change these features; the change then stops having an effect.",
+                                       "es":  "Una actualización de Windows puede cambiar estas funciones y entonces el cambio deja de tener efecto."
+                                   },
+                          "Summary":  {
+                                          "en":  "Turn off WebView2 in Start search",
+                                          "es":  "Desactivar WebView2 de la búsqueda de Inicio"
+                                      },
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Reboot":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisableSearchWebView2"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "UCPD",
+                          "Section":  "advanced",
+                          "Category":  {
+                                           "en":  "Advanced",
+                                           "es":  "Avanzado"
+                                       },
+                          "Title":  {
+                                        "en":  "Disable UCPD (default apps protection)?",
+                                        "es":  "¿Desactivar UCPD (protección de apps predeterminadas)?"
+                                    },
+                          "Body":  {
+                                       "en":  "UCPD stops tools from changing your default browser, PDF reader and other defaults. Disable it only if you need a tool to change them.",
+                                       "es":  "UCPD impide que las herramientas cambien tu navegador, lector de PDF y otras apps predeterminadas. Desactívalo solo si necesitas que una herramienta las cambie."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "UCPD.sys driver: startup set to disabled.",
+                                                     "Scheduled task \"UCPD velocity\": disabled so it does not turn the driver back on.",
+                                                     "The original state is saved; Undo restores it."
+                                                 ],
+                                          "es":  [
+                                                     "Driver UCPD.sys: inicio deshabilitado.",
+                                                     "Tarea programada \"UCPD velocity\": desactivada para que no vuelva a activar el driver.",
+                                                     "Se guarda el estado original; Deshacer lo restaura."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "This turns off a Windows protection. Windows Update may turn it back on.",
+                                       "es":  "Desactiva una protección de Windows. Windows Update puede volver a activarla."
+                                   },
+                          "Summary":  {
+                                          "en":  "Disable UCPD",
+                                          "es":  "Desactivar UCPD"
+                                      },
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Reboot":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisableUCPD"
+                                          }
+                                      ]
+                      },
+                      {
+                          "Id":  "CPUMitigations",
+                          "Section":  "advanced",
+                          "Category":  {
+                                           "en":  "Processor",
+                                           "es":  "Procesador"
+                                       },
+                          "Title":  {
+                                        "en":  "Turn off CPU mitigations (Spectre/Meltdown)?",
+                                        "es":  "¿Desactivar las mitigaciones de CPU (Spectre/Meltdown)?"
+                                    },
+                          "Body":  {
+                                       "en":  "Windows blocks attacks that read memory through the processor, at some performance cost. Turning the protection off can win that performance back on older CPUs, but leaves the PC more exposed.",
+                                       "es":  "Windows bloquea ataques que leen memoria a través del procesador, a costa de algo de rendimiento. Desactivar esa protección puede recuperar rendimiento en CPUs viejas, pero deja la PC más expuesta."
+                                   },
+                          "Details":  {
+                                          "en":  [
+                                                     "Writes FeatureSettingsOverride = 3 and FeatureSettingsOverrideMask = 3 in Memory Management.",
+                                                     "Turns off the Windows mitigations for Spectre variant 2 and Meltdown.",
+                                                     "The original values are saved; Undo restores them.",
+                                                     "It takes effect after restarting."
+                                                 ],
+                                          "es":  [
+                                                     "Escribe FeatureSettingsOverride = 3 y FeatureSettingsOverrideMask = 3 en Memory Management.",
+                                                     "Desactiva las mitigaciones de Windows para Spectre variante 2 y Meltdown.",
+                                                     "Se guardan los valores originales; Deshacer los restaura.",
+                                                     "Se aplica después de reiniciar."
+                                                 ]
+                                      },
+                          "Note":  {
+                                       "en":  "Lowers security, especially with untrusted programs or websites. Do not use it on PCs with work or sensitive data.",
+                                       "es":  "Baja la seguridad, sobre todo con programas o sitios web no confiables. No lo uses en PCs con datos de trabajo o sensibles."
+                                   },
+                          "Summary":  {
+                                          "en":  "Turn off CPU mitigations",
+                                          "es":  "Desactivar mitigaciones de CPU"
+                                      },
+                          "YesLabel":  {
+                                           "en":  "Yes, turn off",
+                                           "es":  "Sí, desactivar"
+                                       },
+                          "Advice":  "CPUMitigations",
+                          "Recommended":  false,
+                          "Reversible":  true,
+                          "Reboot":  true,
+                          "Actions":  [
+                                          {
+                                              "Key":  "WPFTweaksDisableCPUMitigations"
+                                          }
+                                      ]
+                      }
+                  ]
 }
 '@ | ConvertFrom-Json
 $sync.configs.localization = @'
@@ -9671,21 +11901,9 @@ $sync.configs.localization = @'
                "WPFRestoreWindowsUpdate":  {
                                                "Content":  "Restaurar Windows Update"
                                            },
-               "WPFDefenderHeading":  {
-                                          "Text":  "Windows Defender"
-                                      },
-               "WPFDefenderDescription":  {
-                                              "Text":  "Activa o desactiva la protección en tiempo real mediante los comandos oficiales de Microsoft Defender. Requiere administrador. La protección contra alteraciones o las políticas del equipo pueden impedir el cambio; Windows puede reactivarla. No detiene ni elimina servicios antivirus protegidos."
-                                          },
-               "WPFDefenderRealtimeStatus":  {
-                                                 "Text":  "Consultando Windows Defender..."
-                                             },
-               "WPFDisableDefenderRealtime":  {
-                                                  "Content":  "Desactivar protección"
-                                              },
-               "WPFEnableDefenderRealtime":  {
-                                                 "Content":  "Activar protección"
-                                             }
+               "GuidedModeMenuItem":  {
+                                          "Header":  "Modo guiado"
+                                      }
            },
     "en":  {
 
@@ -9946,7 +12164,7 @@ $sync.configs.tweaks = @'
                             "category":  "Essential Tweaks",
                             "panel":  "1",
                             "InvokeScript":  [
-                                                 "\r\n      # Sometimes if you dont stop the Widgets process the removal may fail\r\n\r\n      Get-Process *Widget* | Stop-Process\r\n      Get-AppxPackage Microsoft.WidgetsPlatformRuntime -AllUsers | Remove-AppxPackage -AllUsers\r\n      Get-AppxPackage MicrosoftWindows.Client.WebExperience -AllUsers | Remove-AppxPackage -AllUsers\r\n\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      Write-Host \"Removed widgets\"\r\n      "
+                                                 "\n      # Sometimes if you dont stop the Widgets process the removal may fail\n\n      Get-Process *Widget* | Stop-Process\n      Get-AppxPackage Microsoft.WidgetsPlatformRuntime -AllUsers | Remove-AppxPackage -AllUsers\n      Get-AppxPackage MicrosoftWindows.Client.WebExperience -AllUsers | Remove-AppxPackage -AllUsers\n\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      Write-Host \"Removed widgets\"\n      "
                                              ],
                             "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/widget"
                         },
@@ -10049,34 +12267,44 @@ $sync.configs.tweaks = @'
                                               }
                                           ],
                               "InvokeScript":  [
-                                                   "\r\n      $Memory = (Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum).Sum / 1KB\r\n      Set-ItemProperty -Path \"HKLM:\\SYSTEM\\CurrentControlSet\\Control\" -Name SvcHostSplitThresholdInKB -Value $Memory\r\n      "
+                                                   "\n      $Memory = (Get-CimInstance Win32_PhysicalMemory | Measure-Object Capacity -Sum).Sum / 1KB\n      Set-ItemProperty -Path \"HKLM:\\SYSTEM\\CurrentControlSet\\Control\" -Name SvcHostSplitThresholdInKB -Value $Memory\n      "
                                                ],
                               "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/services"
                           },
     "WPFServiceGroupDiagnostics":  {
-                                       "Content":  "Disable Useless Services",
-                                       "Description":  "Expand the arrow to choose Windows services. Marking or unmarking only prepares changes; press Apply Tweaks to disable selected services or restore unchecked services. The main checkbox selects all available services. Some support diagnostics, device management or networking. NetTcpPortSharing is often disabled by default; restoring it sets Manual startup.",
+                                       "Content":  "Disable Diagnostic Services",
+                                       "Description":  "Expand the arrow to choose Windows diagnostic and telemetry services: diagnostic hosts, Diagnostic Policy Service, DiagTrack, Error Reporting and the Diagnostics Hub collector. Marking or unmarking only prepares changes; press Apply Tweaks to disable selected services or restore unchecked services. The main checkbox selects all available services. Disabling them stops Windows troubleshooters, problem detection and error reports.",
                                        "Type":  "ServiceGroup",
                                        "category":  "z__Advanced Tweaks - CAUTION",
                                        "panel":  "1",
                                        "Children":  [
                                                         "WPFToggleServiceWdiSystemHost",
                                                         "WPFToggleServiceWdiServiceHost",
-                                                        "WPFToggleServiceDiagTrack",
-                                                        "WPFToggleServiceShellHWDetection",
                                                         "WPFToggleServiceDPS",
-                                                        "WPFToggleServiceWMPNetworkSvc",
-                                                        "WPFToggleServicewisvc",
+                                                        "WPFToggleServiceDiagTrack",
                                                         "WPFToggleServiceWerSvc",
-                                                        "WPFToggleServiceFontCache3000",
-                                                        "WPFToggleServiceRetailDemo",
-                                                        "WPFToggleServiceDiagnosticsHub",
-                                                        "WPFToggleServiceDmwappushservice",
-                                                        "WPFToggleServiceWhesvc",
-                                                        "WPFToggleServiceNetTcpPortSharing"
+                                                        "WPFToggleServiceDiagnosticsHub"
                                                     ],
                                        "link":  "https://learn.microsoft.com/en-us/windows/iot/iot-enterprise/optimize/services"
                                    },
+    "WPFServiceGroupUseless":  {
+                                   "Content":  "Disable Useless Services",
+                                   "Description":  "Expand the arrow to choose optional Windows services. Marking or unmarking only prepares changes; press Apply Tweaks to disable selected services or restore unchecked services. The main checkbox selects all available services. Some support AutoPlay, device management or .NET networking. NetTcpPortSharing is often disabled by default; restoring it sets Manual startup.",
+                                   "Type":  "ServiceGroup",
+                                   "category":  "z__Advanced Tweaks - CAUTION",
+                                   "panel":  "1",
+                                   "Children":  [
+                                                    "WPFToggleServiceShellHWDetection",
+                                                    "WPFToggleServiceWMPNetworkSvc",
+                                                    "WPFToggleServicewisvc",
+                                                    "WPFToggleServiceFontCache3000",
+                                                    "WPFToggleServiceRetailDemo",
+                                                    "WPFToggleServiceDmwappushservice",
+                                                    "WPFToggleServiceWhesvc",
+                                                    "WPFToggleServiceNetTcpPortSharing"
+                                                ],
+                                   "link":  "https://learn.microsoft.com/en-us/windows/iot/iot-enterprise/optimize/services"
+                               },
     "WPFDriverGroupOptional":  {
                                    "Content":  "Disable Useless Drivers (advanced)",
                                    "Description":  "Optional kernel drivers, NOT a recommended preset. Marking or unmarking only queues changes until Apply Tweaks, when driver disables require confirmation. Original startup settings are backed up for Undo. Boot/System and critical drivers are locked; missing drivers are hidden. Changes take effect after reboot and may affect media, networking or power monitoring. Does not delete .sys files. UCPD.sys remains a separate advanced tweak.",
@@ -10280,7 +12508,7 @@ $sync.configs.tweaks = @'
                                              "Content":  "Shell Hardware Detection (ShellHWDetection)",
                                              "Description":  "Provides AutoPlay notifications when media or devices are connected. Disabling removes those notifications and can affect device-related features. Undo restores Automatic startup.",
                                              "Type":  "Toggle",
-                                             "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                             "ParentGroup":  "WPFServiceGroupUseless",
                                              "category":  "z__Advanced Tweaks - CAUTION",
                                              "panel":  "1",
                                              "service":  [
@@ -10326,7 +12554,7 @@ $sync.configs.tweaks = @'
                                           "Content":  "Media Player Network Sharing (WMPNetworkSvc)",
                                           "Description":  "Shares Windows Media Player libraries with networked players and devices. Disabling removes that sharing. Undo restores Manual startup; this service may not exist on some Windows installations.",
                                           "Type":  "Toggle",
-                                          "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                          "ParentGroup":  "WPFServiceGroupUseless",
                                           "category":  "z__Advanced Tweaks - CAUTION",
                                           "panel":  "1",
                                           "service":  [
@@ -10346,7 +12574,7 @@ $sync.configs.tweaks = @'
                                   "Content":  "Windows Insider Service (wisvc)",
                                   "Description":  "Used by the Windows Insider Program for preview builds. Disabling can interfere with Insider functionality. Undo restores Manual startup; the service may be absent.",
                                   "Type":  "Toggle",
-                                  "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                  "ParentGroup":  "WPFServiceGroupUseless",
                                   "category":  "z__Advanced Tweaks - CAUTION",
                                   "panel":  "1",
                                   "service":  [
@@ -10386,7 +12614,7 @@ $sync.configs.tweaks = @'
                                           "Content":  "WPF Font Cache (FontCache3.0.0.0)",
                                           "Description":  "Caches fonts for older Windows Presentation Foundation applications. Disabling may slow some .NET/WPF applications; often absent on newer Windows. Undo restores Manual startup.",
                                           "Type":  "Toggle",
-                                          "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                          "ParentGroup":  "WPFServiceGroupUseless",
                                           "category":  "z__Advanced Tweaks - CAUTION",
                                           "panel":  "1",
                                           "service":  [
@@ -10406,7 +12634,7 @@ $sync.configs.tweaks = @'
                                        "Content":  "Retail Demo Service (RetailDemo)",
                                        "Description":  "Used to display retail demonstration experiences on store devices. Disabling prevents retail demo functionality. Undo restores Manual startup.",
                                        "Type":  "Toggle",
-                                       "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                       "ParentGroup":  "WPFServiceGroupUseless",
                                        "category":  "z__Advanced Tweaks - CAUTION",
                                        "panel":  "1",
                                        "service":  [
@@ -10446,7 +12674,7 @@ $sync.configs.tweaks = @'
                                              "Content":  "Device Management WAP Push (dmwappushservice)",
                                              "Description":  "Routes device management push messages. Disabling can interrupt MDM/Intune management and device enrollment. Undo restores Manual startup.",
                                              "Type":  "Toggle",
-                                             "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                             "ParentGroup":  "WPFServiceGroupUseless",
                                              "category":  "z__Advanced Tweaks - CAUTION",
                                              "panel":  "1",
                                              "service":  [
@@ -10466,7 +12694,7 @@ $sync.configs.tweaks = @'
                                    "Content":  "Windows Health and Optimized Experiences (whesvc)",
                                    "Description":  "Monitors device health for optimized Windows experiences. Disabling may affect device health and optimization features; it is not present on every Windows version. Undo restores Automatic startup and starts the service.",
                                    "Type":  "Toggle",
-                                   "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                   "ParentGroup":  "WPFServiceGroupUseless",
                                    "category":  "z__Advanced Tweaks - CAUTION",
                                    "panel":  "1",
                                    "service":  [
@@ -10488,7 +12716,7 @@ $sync.configs.tweaks = @'
                                               "Content":  "Net.TCP Port Sharing (NetTcpPortSharing)",
                                               "Description":  "Allows Windows Communication Foundation applications to share TCP ports. This service is disabled on Windows by default; if already disabled, its checkbox starts checked. Unchecking sets Manual startup without starting it (required when using WCF port sharing).",
                                               "Type":  "Toggle",
-                                              "ParentGroup":  "WPFServiceGroupDiagnostics",
+                                              "ParentGroup":  "WPFServiceGroupUseless",
                                               "category":  "z__Advanced Tweaks - CAUTION",
                                               "panel":  "1",
                                               "service":  [
@@ -10525,6 +12753,53 @@ $sync.configs.tweaks = @'
                                                          ],
                                           "link":  "https://learn.microsoft.com/en-us/troubleshoot/windows-client/shell-experience/windows-search-performance-issues"
                                       },
+    "WPFTweaksDisableSearchWebView2":  {
+                                           "Content":  "Start Search WebView2 Processes - Disable [restart required]",
+                                           "Description":  "Stops SearchHost.exe from keeping msedgewebview2.exe processes running in the background. Writes the same feature override as \u0027vivetool /disable /id:37926450\u0027 (SearchWebView2) directly to the registry, without running ViVeTool. Also turns off the new Start menu search interface. Microsoft can rename or remove this feature in an update, and then the override has no effect. Requires a restart. Undo removes the override.",
+                                           "category":  "z__Advanced Tweaks - CAUTION",
+                                           "panel":  "1",
+                                           "registry":  [
+                                                            {
+                                                                "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8\\1694661260",
+                                                                "Name":  "EnabledState",
+                                                                "Value":  "1",
+                                                                "Type":  "DWord",
+                                                                "OriginalValue":  "\u003cRemoveEntry\u003e"
+                                                            },
+                                                            {
+                                                                "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8\\1694661260",
+                                                                "Name":  "EnabledStateOptions",
+                                                                "Value":  "0",
+                                                                "Type":  "DWord",
+                                                                "OriginalValue":  "\u003cRemoveEntry\u003e"
+                                                            },
+                                                            {
+                                                                "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8\\1694661260",
+                                                                "Name":  "Variant",
+                                                                "Value":  "0",
+                                                                "Type":  "DWord",
+                                                                "OriginalValue":  "\u003cRemoveEntry\u003e"
+                                                            },
+                                                            {
+                                                                "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8\\1694661260",
+                                                                "Name":  "VariantPayload",
+                                                                "Value":  "0",
+                                                                "Type":  "DWord",
+                                                                "OriginalValue":  "\u003cRemoveEntry\u003e"
+                                                            },
+                                                            {
+                                                                "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8\\1694661260",
+                                                                "Name":  "VariantPayloadKind",
+                                                                "Value":  "0",
+                                                                "Type":  "DWord",
+                                                                "OriginalValue":  "\u003cRemoveEntry\u003e"
+                                                            }
+                                                        ],
+                                           "UndoScript":  [
+                                                              "# ViVeTool /reset deletes the whole override key; remove it once its values are gone.\n      $overrideKey = \u0027HKLM:\\SYSTEM\\CurrentControlSet\\Control\\FeatureManagement\\Overrides\\8\\1694661260\u0027\n      if ((Test-Path -LiteralPath $overrideKey) -and @((Get-Item -LiteralPath $overrideKey).GetValueNames()).Count -eq 0) { Remove-Item -LiteralPath $overrideKey -ErrorAction Stop }"
+                                                          ],
+                                           "link":  "https://github.com/thebookisclosed/ViVe"
+                                       },
     "WPFTaskGroupTelemetry":  {
                                   "Content":  "Disable Optional Scheduled Tasks",
                                   "Description":  "Choose optional telemetry, compatibility, Windows Media Sharing and Firefox tasks in the dropdown. Marking or unmarking only stages changes; click Apply Tweaks to disable selected tasks or restore unchecked tasks previously managed by APBOptimizer. The master checkbox selects all manageable tasks. Missing tasks are hidden, and tasks disabled outside APBOptimizer are protected. Each task has an independent backup for Undo.",
@@ -10779,6 +13054,19 @@ $sync.configs.tweaks = @'
                                                            ],
                                             "link":  "https://learn.microsoft.com/en-us/windows/client-management/mdm/policy-csp-admx-power#powerthrottlingturnoff"
                                         },
+    "WPFTweaksDisableDevicePowerSaving":  {
+                                              "Content":  "USB Selective Suspend \u0026 PCIe Link State - Disable",
+                                              "Description":  "Windows 10/11 power plan option. Uses powercfg to set USB selective suspend and PCI Express Link State Power Management (ASPM) to Off for the plugged-in (AC) setting of the active power plan, then reactivates the plan. It can reduce USB mouse, controller or audio dropouts and PCIe wake-up latency; performance gains are not guaranteed. Battery (DC) values and other power plans are not changed. Power draw and idle temperature may increase slightly. Requires administrator rights; no restart needed. Saves the original AC values and the plan GUID so Undo Selected Tweaks can restore them.",
+                                              "category":  "z__Advanced Tweaks - CAUTION",
+                                              "panel":  "1",
+                                              "InvokeScript":  [
+                                                                   "Set-WinUtilDevicePowerSaving -Mode Disable"
+                                                               ],
+                                              "UndoScript":  [
+                                                                 "Set-WinUtilDevicePowerSaving -Mode Restore"
+                                                             ],
+                                              "link":  "https://learn.microsoft.com/en-us/windows-hardware/customize/power-settings/usb-settings-usb-selective-suspend-setting"
+                                          },
     "WPFTweaksDisableCPUMitigations":  {
                                            "Content":  "CPU Mitigations (Spectre/Meltdown) - Disable [restart required]",
                                            "Description":  "Advanced opt-in security setting for Windows 10/11. Follows shoober420/CPU_Mitigations.bat and Microsoft KB4073119: writes FeatureSettingsOverride=3 and FeatureSettingsOverrideMask=3 (REG_DWORD) under HKLM\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Memory Management. Disables operating-system speculative-execution mitigations including Spectre Variant 2 and Meltdown; other CPU, firmware and Windows protections are outside its scope. It substantially reduces security, especially on computers with untrusted applications or websites. Performance gains depend on CPU and workload and are not guaranteed. Requires administrator permissions and reboot. Saves both original registry values, including absent ones, so Undo Selected Tweaks can restore them. No third-party EXE or BAT is executed.",
@@ -11144,10 +13432,10 @@ $sync.configs.tweaks = @'
                                                 }
                                             ],
                                "InvokeScript":  [
-                                                    "\r\n      # Disable Defender Auto Sample Submission\r\n      Set-MpPreference -SubmitSamplesConsent 2\r\n\r\n      # Disable (Connected User Experiences and Telemetry) Service\r\n      Set-Service -Name diagtrack -StartupType Disabled\r\n\r\n      # Disable (Windows Error Reporting Manager) Service\r\n      Set-Service -Name wermgr -StartupType Disabled\r\n\r\n      # Disable PowerShell 7 telemetry\r\n      [Environment]::SetEnvironmentVariable(\u0027POWERSHELL_TELEMETRY_OPTOUT\u0027, \u00271\u0027, \u0027Machine\u0027)\r\n\r\n      Remove-ItemProperty -Path \"HKCU:\\Software\\Microsoft\\Siuf\\Rules\" -Name PeriodInNanoSeconds\r\n      "
+                                                    "\n      # Disable Defender Auto Sample Submission (skipped when Defender is not installed)\n      if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) { Set-MpPreference -SubmitSamplesConsent 2 }\n\n      # Disable (Connected User Experiences and Telemetry) Service\n      Set-Service -Name diagtrack -StartupType Disabled\n\n      # Disable (Windows Error Reporting Manager) Service; most Windows builds do not have it\n      if (Get-Service -Name wermgr -ErrorAction SilentlyContinue) { Set-Service -Name wermgr -StartupType Disabled }\n\n      # Disable PowerShell 7 telemetry\n      [Environment]::SetEnvironmentVariable(\u0027POWERSHELL_TELEMETRY_OPTOUT\u0027, \u00271\u0027, \u0027Machine\u0027)\n\n      Remove-ItemProperty -Path \"HKCU:\\Software\\Microsoft\\Siuf\\Rules\" -Name PeriodInNanoSeconds -ErrorAction SilentlyContinue\n      "
                                                 ],
                                "UndoScript":  [
-                                                  "\r\n      # Enable Defender Auto Sample Submission\r\n      Set-MpPreference -SubmitSamplesConsent 1\r\n\r\n      # Enable (Connected User Experiences and Telemetry) Service\r\n      Set-Service -Name diagtrack -StartupType Automatic\r\n\r\n      # Enable (Windows Error Reporting Manager) Service\r\n      Set-Service -Name wermgr -StartupType Automatic\r\n\r\n      # Enable PowerShell 7 telemetry\r\n      [Environment]::SetEnvironmentVariable(\u0027POWERSHELL_TELEMETRY_OPTOUT\u0027, \u0027\u0027, \u0027Machine\u0027)\r\n      "
+                                                  "\n      # Enable Defender Auto Sample Submission (skipped when Defender is not installed)\n      if (Get-Command Set-MpPreference -ErrorAction SilentlyContinue) { Set-MpPreference -SubmitSamplesConsent 1 }\n\n      # Enable (Connected User Experiences and Telemetry) Service\n      Set-Service -Name diagtrack -StartupType Automatic\n\n      # Enable (Windows Error Reporting Manager) Service; most Windows builds do not have it\n      if (Get-Service -Name wermgr -ErrorAction SilentlyContinue) { Set-Service -Name wermgr -StartupType Automatic }\n\n      # Enable PowerShell 7 telemetry\n      [Environment]::SetEnvironmentVariable(\u0027POWERSHELL_TELEMETRY_OPTOUT\u0027, \u0027\u0027, \u0027Machine\u0027)\n      "
                                               ],
                                "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/telemetry"
                            },
@@ -11173,10 +13461,10 @@ $sync.configs.tweaks = @'
                                 "category":  "z__Advanced Tweaks - CAUTION",
                                 "panel":  "1",
                                 "InvokeScript":  [
-                                                     "\r\n      $Path = Resolve-Path -Path \"$Env:ProgramFiles (x86)\\Microsoft\\Edge\\Application\\*\\Installer\\setup.exe\" | Select-Object -Last 1\r\n\r\n      if (Test-Path $Path) {\r\n          New-Item -Path \"$Env:SystemRoot\\SystemApps\\Microsoft.MicrosoftEdge_8wekyb3d8bbwe\\MicrosoftEdge.exe\" -Force\r\n          Start-Process -FilePath $Path -ArgumentList \"--uninstall --system-level --force-uninstall --delete-profile\" -Wait\r\n          Write-Host \"Microsoft Edge was removed\"\r\n      } else {\r\n          Write-Host \"Microsoft Edge is not installed\"\r\n      }\r\n      "
+                                                     "\n      $Path = Resolve-Path -Path \"$Env:ProgramFiles (x86)\\Microsoft\\Edge\\Application\\*\\Installer\\setup.exe\" | Select-Object -Last 1\n\n      if (Test-Path $Path) {\n          New-Item -Path \"$Env:SystemRoot\\SystemApps\\Microsoft.MicrosoftEdge_8wekyb3d8bbwe\\MicrosoftEdge.exe\" -Force\n          Start-Process -FilePath $Path -ArgumentList \"--uninstall --system-level --force-uninstall --delete-profile\" -Wait\n          Write-Host \"Microsoft Edge was removed\"\n      } else {\n          Write-Host \"Microsoft Edge is not installed\"\n      }\n      "
                                                  ],
                                 "UndoScript":  [
-                                                   "\r\n      Write-Host \"Installing Microsoft Edge...\"\r\n      winget install Microsoft.Edge --source winget\r\n      "
+                                                   "\n      Write-Host \"Installing Microsoft Edge...\"\n      winget install Microsoft.Edge --source winget\n      "
                                                ],
                                 "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/removeedge"
                             },
@@ -11215,10 +13503,10 @@ $sync.configs.tweaks = @'
                                     "category":  "z__Advanced Tweaks - CAUTION",
                                     "panel":  "1",
                                     "InvokeScript":  [
-                                                         "\r\n      # Deny permission to remove OneDrive folder\r\n      icacls $Env:OneDrive /deny \"*S-1-5-32-544:(D,DC)\"\r\n\r\n      Write-Host \"Uninstalling OneDrive...\"\r\n      Start-Process -FilePath (Join-Path $Env:SystemRoot \"System32\\OneDriveSetup.exe\") -ArgumentList \u0027/uninstall\u0027 -Wait\r\n\r\n      # Some of OneDrive files use explorer, and OneDrive uses FileCoAuth\r\n      Write-Host \"Removing leftover OneDrive Files...\"\r\n\r\n      Stop-Process -Name FileCoAuth,Explorer\r\n\r\n      Remove-Item \"$Env:LocalAppData\\Microsoft\\OneDrive\" -Recurse -Force\r\n      Remove-Item \"$Env:ProgramData\\Microsoft OneDrive\" -Recurse -Force\r\n\r\n      # Grant back permission to access OneDrive folder\r\n      icacls $Env:OneDrive /grant \"*S-1-5-32-544:(D,DC)\"\r\n\r\n      if (-not (Get-ChildItem -Path $Env:OneDrive)) {\r\n          Remove-Item -Path $Env:OneDrive -Recurse\r\n          [Environment]::SetEnvironmentVariable(\u0027OneDrive\u0027, $null, \u0027User\u0027)\r\n      }\r\n\r\n      # Disable OneSyncSvc\r\n      Set-Service -Name OneSyncSvc -StartupType Disabled\r\n      "
+                                                         "\n      # Deny permission to remove OneDrive folder\n      icacls $Env:OneDrive /deny \"*S-1-5-32-544:(D,DC)\"\n\n      Write-Host \"Uninstalling OneDrive...\"\n      Start-Process -FilePath (Join-Path $Env:SystemRoot \"System32\\OneDriveSetup.exe\") -ArgumentList \u0027/uninstall\u0027 -Wait\n\n      # Some of OneDrive files use explorer, and OneDrive uses FileCoAuth\n      Write-Host \"Removing leftover OneDrive Files...\"\n\n      Stop-Process -Name FileCoAuth,Explorer\n\n      Remove-Item \"$Env:LocalAppData\\Microsoft\\OneDrive\" -Recurse -Force\n      Remove-Item \"$Env:ProgramData\\Microsoft OneDrive\" -Recurse -Force\n\n      # Grant back permission to access OneDrive folder\n      icacls $Env:OneDrive /grant \"*S-1-5-32-544:(D,DC)\"\n\n      if (-not (Get-ChildItem -Path $Env:OneDrive)) {\n          Remove-Item -Path $Env:OneDrive -Recurse\n          [Environment]::SetEnvironmentVariable(\u0027OneDrive\u0027, $null, \u0027User\u0027)\n      }\n\n      # Disable OneSyncSvc\n      Set-Service -Name OneSyncSvc -StartupType Disabled\n      "
                                                      ],
                                     "UndoScript":  [
-                                                       "\r\n      Write-Host \"Installing OneDrive\"\r\n      winget install Microsoft.Onedrive --source winget\r\n\r\n      # Enabled OneSyncSvc\r\n      Set-Service -Name OneSyncSvc -StartupType Automatic\r\n      "
+                                                       "\n      Write-Host \"Installing OneDrive\"\n      winget install Microsoft.Onedrive --source winget\n\n      # Enabled OneSyncSvc\n      Set-Service -Name OneSyncSvc -StartupType Automatic\n      "
                                                    ],
                                     "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/removeonedrive"
                                 },
@@ -11380,7 +13668,7 @@ $sync.configs.tweaks = @'
                                                    }
                                                ],
                                   "InvokeScript":  [
-                                                       "\r\n      if (-not (Get-ComputerRestorePoint)) {\r\n          Enable-ComputerRestore -Drive $Env:SystemDrive\r\n      }\r\n\r\n      Checkpoint-Computer -Description \"System Restore Point created by WinUtil\" -RestorePointType MODIFY_SETTINGS\r\n      Write-Host \"System Restore Point Created Successfully\" -ForegroundColor Green\r\n      "
+                                                       "\n      if (-not (Get-ComputerRestorePoint)) {\n          Enable-ComputerRestore -Drive $Env:SystemDrive\n      }\n\n      Checkpoint-Computer -Description \"System Restore Point created by WinUtil\" -RestorePointType MODIFY_SETTINGS\n      Write-Host \"System Restore Point Created Successfully\" -ForegroundColor Green\n      "
                                                    ],
                                   "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/restorepoint"
                               },
@@ -11438,7 +13726,7 @@ $sync.configs.tweaks = @'
                                                 }
                                             ],
                                "InvokeScript":  [
-                                                    "\r\n      $Appx = (Get-AppxPackage MicrosoftWindows.Client.CoreAI).PackageFullName\r\n      $Sid = (Get-LocalUser $Env:UserName).Sid.Value\r\n\r\n      New-Item \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Appx\\AppxAllUserStore\\EndOfLife\\$Sid\\$Appx\" -Force\r\n\r\n      Get-AppxPackage -AllUsers \"*Copilot*\" | Remove-AppxPackage -AllUsers\r\n      winget uninstall -e --name \"Copilot\" --silent --force --accept-source-agreements 2\u003e$null\r\n      Get-AppxPackage -AllUsers Microsoft.MicrosoftOfficeHub | Remove-AppxPackage -AllUsers\r\n\r\n      if ($Appx) {\r\n          Remove-AppxPackage $Appx\r\n      }\r\n\r\n      Set-Service -Name WSAIFabricSvc -StartupType Disabled\r\n      Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart\r\n\r\n      Write-Host \"Windows AI Disabled\"\r\n      "
+                                                    "\n      $Appx = (Get-AppxPackage MicrosoftWindows.Client.CoreAI).PackageFullName\n      $Sid = (Get-LocalUser $Env:UserName).Sid.Value\n\n      New-Item \"HKLM:\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\Appx\\AppxAllUserStore\\EndOfLife\\$Sid\\$Appx\" -Force\n\n      Get-AppxPackage -AllUsers \"*Copilot*\" | Remove-AppxPackage -AllUsers\n      winget uninstall -e --name \"Copilot\" --silent --force --accept-source-agreements 2\u003e$null\n      Get-AppxPackage -AllUsers Microsoft.MicrosoftOfficeHub | Remove-AppxPackage -AllUsers\n\n      if ($Appx) {\n          Remove-AppxPackage $Appx\n      }\n\n      Set-Service -Name WSAIFabricSvc -StartupType Disabled\n      Disable-WindowsOptionalFeature -FeatureName Recall -Online -NoRestart\n\n      Write-Host \"Windows AI Disabled\"\n      "
                                                 ],
                                "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/windowsai"
                            },
@@ -11496,10 +13784,10 @@ $sync.configs.tweaks = @'
                                                  }
                                              ],
                                 "InvokeScript":  [
-                                                     "\r\n      $RazerPath = \"$Env:SystemRoot\\Installer\\Razer\"\r\n\r\n      if (Test-Path $RazerPath) {\r\n        Remove-Item $RazerPath\\* -Recurse -Force\r\n      } else {\r\n        New-Item -Path $RazerPath -ItemType Directory\r\n      }\r\n\r\n      icacls $RazerPath /deny \"*S-1-1-0:(W)\"\r\n      "
+                                                     "\n      $RazerPath = \"$Env:SystemRoot\\Installer\\Razer\"\n\n      if (Test-Path $RazerPath) {\n        Remove-Item $RazerPath\\* -Recurse -Force\n      } else {\n        New-Item -Path $RazerPath -ItemType Directory\n      }\n\n      icacls $RazerPath /deny \"*S-1-1-0:(W)\"\n      "
                                                  ],
                                 "UndoScript":  [
-                                                   "\r\n      icacls \"$Env:SystemRoot\\Installer\\Razer\" /remove:d *S-1-1-0\r\n      "
+                                                   "\n      icacls \"$Env:SystemRoot\\Installer\\Razer\" /remove:d *S-1-1-0\n      "
                                                ],
                                 "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/razerblock"
                             },
@@ -11509,10 +13797,10 @@ $sync.configs.tweaks = @'
                                "category":  "z__Advanced Tweaks - CAUTION",
                                "panel":  "1",
                                "InvokeScript":  [
-                                                    "\r\n      Stop-Process -Name \"logi_download_assistant\" -Force -ErrorAction SilentlyContinue\r\n\r\n      $ProgramFiles64 = if ($Env:ProgramW6432) { $Env:ProgramW6432 } else { $Env:ProgramFiles }\r\n      $LogiPath = \"$ProgramFiles64\\LogiDownloadAssistant\"\r\n\r\n      if (Test-Path $LogiPath) {\r\n        Remove-Item $LogiPath\\* -Recurse -Force\r\n      } else {\r\n        New-Item -Path $LogiPath -ItemType Directory\r\n      }\r\n\r\n      icacls $LogiPath /deny \"*S-1-1-0:(W)\"\r\n      if ($LASTEXITCODE -ne 0) { throw \"icacls failed to deny write access on $LogiPath (exit code $LASTEXITCODE)\" }\r\n      "
+                                                    "\n      Stop-Process -Name \"logi_download_assistant\" -Force -ErrorAction SilentlyContinue\n\n      $ProgramFiles64 = if ($Env:ProgramW6432) { $Env:ProgramW6432 } else { $Env:ProgramFiles }\n      $LogiPath = \"$ProgramFiles64\\LogiDownloadAssistant\"\n\n      if (Test-Path $LogiPath) {\n        Remove-Item $LogiPath\\* -Recurse -Force\n      } else {\n        New-Item -Path $LogiPath -ItemType Directory\n      }\n\n      icacls $LogiPath /deny \"*S-1-1-0:(W)\"\n      if ($LASTEXITCODE -ne 0) { throw \"icacls failed to deny write access on $LogiPath (exit code $LASTEXITCODE)\" }\n      "
                                                 ],
                                "UndoScript":  [
-                                                  "\r\n      $ProgramFiles64 = if ($Env:ProgramW6432) { $Env:ProgramW6432 } else { $Env:ProgramFiles }\r\n      $LogiPath = \"$ProgramFiles64\\LogiDownloadAssistant\"\r\n\r\n      if (Test-Path $LogiPath) {\r\n        icacls $LogiPath /remove:d \"*S-1-1-0\"\r\n        if ($LASTEXITCODE -ne 0) { throw \"icacls failed to remove the write-deny rule on $LogiPath (exit code $LASTEXITCODE)\" }\r\n      }\r\n      "
+                                                  "\n      $ProgramFiles64 = if ($Env:ProgramW6432) { $Env:ProgramW6432 } else { $Env:ProgramFiles }\n      $LogiPath = \"$ProgramFiles64\\LogiDownloadAssistant\"\n\n      if (Test-Path $LogiPath) {\n        icacls $LogiPath /remove:d \"*S-1-1-0\"\n        if ($LASTEXITCODE -ne 0) { throw \"icacls failed to remove the write-deny rule on $LogiPath (exit code $LASTEXITCODE)\" }\n      }\n      "
                                               ],
                                "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/logiblock"
                            },
@@ -11545,10 +13833,10 @@ $sync.configs.tweaks = @'
                                    "category":  "z__Advanced Tweaks - CAUTION",
                                    "panel":  "1",
                                    "InvokeScript":  [
-                                                        "\r\n      $hostsUrl = Invoke-RestMethod -Uri https://github.com/Ruddernation-Designs/Adobe-URL-Block-List/raw/refs/heads/master/hosts\r\n      Add-Content -Path \"$Env:SystemRoot\\System32\\drivers\\etc\\hosts\" -Value $hostsUrl\r\n\r\n      ipconfig /flushdns\r\n      Write-Host \u0027Added Adobe url block list from host file\u0027\r\n      "
+                                                        "\n      $hostsUrl = Invoke-RestMethod -Uri https://github.com/Ruddernation-Designs/Adobe-URL-Block-List/raw/refs/heads/master/hosts\n      Add-Content -Path \"$Env:SystemRoot\\System32\\drivers\\etc\\hosts\" -Value $hostsUrl\n\n      ipconfig /flushdns\n      Write-Host \u0027Added Adobe url block list from host file\u0027\n      "
                                                     ],
                                    "UndoScript":  [
-                                                      "\r\n      Set-Content \"$Env:SystemRoot\\System32\\drivers\\etc\\hosts\" (\r\n          (Get-Content \"$Env:SystemRoot\\System32\\drivers\\etc\\hosts\") -join \"`n\" -replace \u0027(?s)#New Ver.*\u0027, \u0027\u0027\r\n      )\r\n\r\n      ipconfig /flushdns\r\n      Write-Host \u0027Removed Adobe url block list from host file\u0027\r\n      "
+                                                      "\n      Set-Content \"$Env:SystemRoot\\System32\\drivers\\etc\\hosts\" (\n          (Get-Content \"$Env:SystemRoot\\System32\\drivers\\etc\\hosts\") -join \"`n\" -replace \u0027(?s)#New Ver.*\u0027, \u0027\u0027\n      )\n\n      ipconfig /flushdns\n      Write-Host \u0027Removed Adobe url block list from host file\u0027\n      "
                                                   ],
                                    "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/blockadobenet"
                                },
@@ -11558,7 +13846,7 @@ $sync.configs.tweaks = @'
                                     "category":  "z__Advanced Tweaks - CAUTION",
                                     "panel":  "1",
                                     "InvokeScript":  [
-                                                         "\r\n      New-Item -Path \"HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\" -Name InprocServer32 -Value \"\" -Force\r\n      Stop-Process -Name explorer\r\n      "
+                                                         "\n      New-Item -Path \"HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\" -Name InprocServer32 -Value \"\" -Force\n      Stop-Process -Name explorer\n      "
                                                      ],
                                     "UndoScript":  [
                                                        "Remove-Item -Path \"HKCU:\\Software\\Classes\\CLSID\\{86ca1aa0-34aa-4e8b-a509-50c905bae2a2}\" -Recurse"
@@ -11571,7 +13859,7 @@ $sync.configs.tweaks = @'
                                  "category":  "Essential Tweaks",
                                  "panel":  "1",
                                  "InvokeScript":  [
-                                                      "\r\n      cleanmgr.exe /d C: /VERYLOWDISK\r\n      Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase\r\n      "
+                                                      "\n      cleanmgr.exe /d C: /VERYLOWDISK\n      Dism.exe /online /Cleanup-Image /StartComponentCleanup /ResetBase\n      "
                                                   ],
                                  "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/diskcleanup"
                              },
@@ -11581,7 +13869,7 @@ $sync.configs.tweaks = @'
                                      "category":  "Essential Tweaks",
                                      "panel":  "1",
                                      "InvokeScript":  [
-                                                          "\r\n      # A temp folder always holds files something has open, including this run\u0027s own, and\r\n      # the job layer counts a logged error as a failed step\r\n      Remove-Item -Path \"$Env:Temp\\*\" -Recurse -Force -ErrorAction SilentlyContinue\r\n      Remove-Item -Path \"$Env:SystemRoot\\Temp\\*\" -Recurse -Force -ErrorAction SilentlyContinue\r\n      "
+                                                          "\n      # A temp folder always holds files something has open, including this run\u0027s own, and\n      # the job layer counts a logged error as a failed step\n      Remove-Item -Path \"$Env:Temp\\*\" -Recurse -Force -ErrorAction SilentlyContinue\n      Remove-Item -Path \"$Env:SystemRoot\\Temp\\*\" -Recurse -Force -ErrorAction SilentlyContinue\n      "
                                                       ],
                                      "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/deletetempfiles"
                                  },
@@ -11661,16 +13949,88 @@ $sync.configs.tweaks = @'
                                                 ],
                                    "link":  "https://winutil.christitus.com/code-reference/tweaks/z--advanced-tweaks---caution/disablebgapps"
                                },
+    "WPFTweaksDeBloat":  {
+                             "Content":  "Remove ALL MS Store Apps - NOT RECOMMENDED",
+                             "Description":  "High impact: removes a legacy WinUtil list of Microsoft Store apps for all users and deprovisions them for new accounts. This includes Minecraft Bedrock, Gaming Services, media apps, communications apps and some third-party Store apps when present. It does not literally remove every Store app: Microsoft Store and essential frameworks are left alone. No automatic Undo is available; removed apps and games must be reinstalled separately, and some app data may be lost.",
+                             "category":  "z__Advanced Tweaks - CAUTION",
+                             "panel":  "1",
+                             "Checked":  "False",
+                             "appx":  [
+                                          "Microsoft.Microsoft3DViewer",
+                                          "Microsoft.AppConnector",
+                                          "Microsoft.BingFinance",
+                                          "Microsoft.BingNews",
+                                          "Microsoft.BingSports",
+                                          "Microsoft.BingTranslator",
+                                          "Microsoft.BingWeather",
+                                          "Microsoft.BingFoodAndDrink",
+                                          "Microsoft.BingHealthAndFitness",
+                                          "Microsoft.BingTravel",
+                                          "Microsoft.MinecraftUWP",
+                                          "Microsoft.GamingServices",
+                                          "Microsoft.GetHelp",
+                                          "Microsoft.Getstarted",
+                                          "Microsoft.Messaging",
+                                          "Microsoft.MicrosoftSolitaireCollection",
+                                          "Microsoft.NetworkSpeedTest",
+                                          "Microsoft.News",
+                                          "Microsoft.Office.Lens",
+                                          "Microsoft.Office.Sway",
+                                          "Microsoft.Office.OneNote",
+                                          "Microsoft.OneConnect",
+                                          "Microsoft.People",
+                                          "Microsoft.Print3D",
+                                          "Microsoft.SkypeApp",
+                                          "Microsoft.Wallet",
+                                          "Microsoft.Whiteboard",
+                                          "Microsoft.WindowsAlarms",
+                                          "microsoft.windowscommunicationsapps",
+                                          "Microsoft.WindowsFeedbackHub",
+                                          "Microsoft.WindowsMaps",
+                                          "Microsoft.WindowsSoundRecorder",
+                                          "Microsoft.ConnectivityStore",
+                                          "Microsoft.ScreenSketch",
+                                          "Microsoft.MixedReality.Portal",
+                                          "Microsoft.ZuneMusic",
+                                          "Microsoft.ZuneVideo",
+                                          "Microsoft.MicrosoftOfficeHub",
+                                          "*EclipseManager*",
+                                          "*ActiproSoftwareLLC*",
+                                          "*AdobeSystemsIncorporated.AdobePhotoshopExpress*",
+                                          "*Duolingo-LearnLanguagesforFree*",
+                                          "*PandoraMediaInc*",
+                                          "*CandyCrush*",
+                                          "*BubbleWitch3Saga*",
+                                          "*Wunderlist*",
+                                          "*Flipboard*",
+                                          "*Twitter*",
+                                          "*Facebook*",
+                                          "*Royal Revolt*",
+                                          "*Sway*",
+                                          "*Speed Test*",
+                                          "*Dolby*",
+                                          "*Viber*",
+                                          "*ACGMediaPlayer*",
+                                          "*Netflix*",
+                                          "*OneCalendar*",
+                                          "*LinkedInforWindows*",
+                                          "*HiddenCityMysteryofShadows*",
+                                          "*Hulu*",
+                                          "*HiddenCity*",
+                                          "*AdobePhotoshopExpress*",
+                                          "*HotspotShieldFreeVPN*"
+                                      ]
+                         },
     "WPFTweaksDisableExplorerAutoDiscovery":  {
                                                   "Content":  "File Explorer Automatic Folder Discovery - Disable",
                                                   "Description":  "Windows Explorer automatically tries to guess the type of the folder based on its contents, slowing down the browsing experience. WARNING! Will disable File Explorer grouping.",
                                                   "category":  "Essential Tweaks",
                                                   "panel":  "1",
                                                   "InvokeScript":  [
-                                                                       "\r\n      # Previously detected folders\r\n      $bags = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\"\r\n\r\n      # Folder types lookup table\r\n      $bagMRU = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU\"\r\n\r\n      # Flush Explorer view database\r\n      Remove-Item -Path $bags -Recurse -Force\r\n      Write-Host \"Removed $bags\"\r\n\r\n      Remove-Item -Path $bagMRU -Recurse -Force\r\n      Write-Host \"Removed $bagMRU\"\r\n\r\n      # Every folder\r\n      $allFolders = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\AllFolders\\Shell\"\r\n\r\n      if (!(Test-Path $allFolders)) {\r\n        New-Item -Path $allFolders -Force\r\n        Write-Host \"Created $allFolders\"\r\n      }\r\n\r\n      # Generic view\r\n      New-ItemProperty -Path $allFolders -Name \"FolderType\" -Value \"NotSpecified\" -PropertyType String -Force\r\n      Write-Host \"Set FolderType to NotSpecified\"\r\n\r\n      Write-Host Please sign out and back in, or restart your computer to apply the changes!\r\n      "
+                                                                       "\n      # Previously detected folders\n      $bags = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\"\n\n      # Folder types lookup table\n      $bagMRU = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU\"\n\n      # Flush Explorer view database\n      Remove-Item -Path $bags -Recurse -Force\n      Write-Host \"Removed $bags\"\n\n      Remove-Item -Path $bagMRU -Recurse -Force\n      Write-Host \"Removed $bagMRU\"\n\n      # Every folder\n      $allFolders = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\\AllFolders\\Shell\"\n\n      if (!(Test-Path $allFolders)) {\n        New-Item -Path $allFolders -Force\n        Write-Host \"Created $allFolders\"\n      }\n\n      # Generic view\n      New-ItemProperty -Path $allFolders -Name \"FolderType\" -Value \"NotSpecified\" -PropertyType String -Force\n      Write-Host \"Set FolderType to NotSpecified\"\n\n      Write-Host Please sign out and back in, or restart your computer to apply the changes!\n      "
                                                                    ],
                                                   "UndoScript":  [
-                                                                     "\r\n      # Previously detected folders\r\n      $bags = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\"\r\n\r\n      # Folder types lookup table\r\n      $bagMRU = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU\"\r\n\r\n      # Flush Explorer view database\r\n      Remove-Item -Path $bags -Recurse -Force\r\n      Write-Host \"Removed $bags\"\r\n\r\n      Remove-Item -Path $bagMRU -Recurse -Force\r\n      Write-Host \"Removed $bagMRU\"\r\n\r\n      Write-Host Please sign out and back in, or restart your computer to apply the changes!\r\n      "
+                                                                     "\n      # Previously detected folders\n      $bags = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\Bags\"\n\n      # Folder types lookup table\n      $bagMRU = \"HKCU:\\Software\\Classes\\Local Settings\\Software\\Microsoft\\Windows\\Shell\\BagMRU\"\n\n      # Flush Explorer view database\n      Remove-Item -Path $bags -Recurse -Force\n      Write-Host \"Removed $bags\"\n\n      Remove-Item -Path $bagMRU -Recurse -Force\n      Write-Host \"Removed $bagMRU\"\n\n      Write-Host Please sign out and back in, or restart your computer to apply the changes!\n      "
                                                                  ],
                                                   "link":  "https://winutil.christitus.com/code-reference/tweaks/essential-tweaks/disableexplorerautodiscovery"
                                               },
@@ -11743,10 +14103,10 @@ $sync.configs.tweaks = @'
                                                }
                                            ],
                               "InvokeScript":  [
-                                                   "\r\n      Invoke-WinUtilExplorerUpdate\r\n      if ($sync.ThemeButton.Content -eq [char]0xF08C) {\r\n        Invoke-WinutilThemeChange -theme \"Auto\"\r\n      }\r\n      "
+                                                   "\n      Invoke-WinUtilExplorerUpdate\n      if ($sync.ThemeButton.Content -eq [char]0xF08C) {\n        Invoke-WinutilThemeChange -theme \"Auto\"\n      }\n      "
                                                ],
                               "UndoScript":  [
-                                                 "\r\n      Invoke-WinUtilExplorerUpdate\r\n      if ($sync.ThemeButton.Content -eq [char]0xF08C) {\r\n        Invoke-WinutilThemeChange -theme \"Auto\"\r\n      }\r\n      "
+                                                 "\n      Invoke-WinUtilExplorerUpdate\n      if ($sync.ThemeButton.Content -eq [char]0xF08C) {\n        Invoke-WinutilThemeChange -theme \"Auto\"\n      }\n      "
                                              ],
                               "link":  "https://winutil.christitus.com/code-reference/tweaks/customize-preferences/darkmode"
                           },
@@ -11767,10 +14127,10 @@ $sync.configs.tweaks = @'
                                               }
                                           ],
                              "InvokeScript":  [
-                                                  "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                  "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                               ],
                              "UndoScript":  [
-                                                "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                             ],
                              "link":  "https://winutil.christitus.com/code-reference/tweaks/customize-preferences/showext"
                          },
@@ -11791,10 +14151,10 @@ $sync.configs.tweaks = @'
                                                   }
                                               ],
                                  "InvokeScript":  [
-                                                      "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                      "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                                   ],
                                  "UndoScript":  [
-                                                    "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                    "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                                 ],
                                  "link":  "https://winutil.christitus.com/code-reference/tweaks/customize-preferences/hiddenfiles"
                              },
@@ -12132,10 +14492,10 @@ $sync.configs.tweaks = @'
                                                                }
                                                            ],
                                               "InvokeScript":  [
-                                                                   "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                                   "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                                                ],
                                               "UndoScript":  [
-                                                                 "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                                 "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                                              ],
                                               "link":  "https://winutil.christitus.com/code-reference/tweaks/customize-preferences/startmenurecommendations"
                                           },
@@ -12174,10 +14534,10 @@ $sync.configs.tweaks = @'
                                                        }
                                                    ],
                                       "InvokeScript":  [
-                                                           "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                           "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                                        ],
                                       "UndoScript":  [
-                                                         "\r\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\r\n      "
+                                                         "\n      Invoke-WinUtilExplorerUpdate -action \"restart\"\n      "
                                                      ],
                                       "link":  "https://winutil.christitus.com/code-reference/tweaks/customize-preferences/taskbaralignment"
                                   },
@@ -12243,6 +14603,94 @@ $sync.configs.tweaks = @'
                                            ],
                               "link":  "https://winutil.christitus.com/code-reference/tweaks/customize-preferences/gamemode"
                           },
+    "WPFToggleGameDVR":  {
+                             "Content":  "Game DVR Background Recording",
+                             "Description":  "Toggles Xbox Game Bar background capture (Record what happened). Turning it off avoids continuous video encoding while gaming. Screenshots and manual recording are not removed.",
+                             "category":  "Customize Preferences",
+                             "panel":  "2",
+                             "Type":  "Toggle",
+                             "registry":  [
+                                              {
+                                                  "Path":  "HKCU:\\System\\GameConfigStore",
+                                                  "Name":  "GameDVR_Enabled",
+                                                  "Value":  "1",
+                                                  "Type":  "DWord",
+                                                  "OriginalValue":  "0",
+                                                  "DefaultState":  "true"
+                                              },
+                                              {
+                                                  "Path":  "HKCU:\\Software\\Microsoft\\Windows\\CurrentVersion\\GameDVR",
+                                                  "Name":  "AppCaptureEnabled",
+                                                  "Value":  "1",
+                                                  "Type":  "DWord",
+                                                  "OriginalValue":  "0",
+                                                  "DefaultState":  "true"
+                                              }
+                                          ],
+                             "link":  "https://support.microsoft.com/en-us/windows/record-a-game-clip-on-your-pc-with-xbox-game-bar-2f477001-54df-4a17-b1fc-e4a4cb4ac28c"
+                         },
+    "WPFToggleHAGS":  {
+                          "Content":  "Hardware-Accelerated GPU Scheduling",
+                          "Description":  "Toggles GPU scheduling by the graphics card (HwSchMode). Requires a WDDM 2.7+ GPU and driver, and a restart. Results vary by GPU and game; Windows ignores it on unsupported hardware.",
+                          "category":  "Customize Preferences",
+                          "panel":  "2",
+                          "Type":  "Toggle",
+                          "registry":  [
+                                           {
+                                               "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\GraphicsDrivers",
+                                               "Name":  "HwSchMode",
+                                               "Value":  "2",
+                                               "Type":  "DWord",
+                                               "OriginalValue":  "1",
+                                               "DefaultState":  "false"
+                                           }
+                                       ],
+                          "link":  "https://devblogs.microsoft.com/directx/hardware-accelerated-gpu-scheduling/"
+                      },
+    "WPFToggleGamingMultimediaProfile":  {
+                                             "Content":  "Multimedia Gaming Profile",
+                                             "Description":  "Toggles the MMCSS system profile: reserves 10% CPU for background tasks instead of 20% (SystemResponsiveness) and turns off multimedia network throttling (NetworkThrottlingIndex 0xFFFFFFFF). Turning it off restores the Windows defaults 20 and 10. FPS gains are not guaranteed.",
+                                             "category":  "Customize Preferences",
+                                             "panel":  "2",
+                                             "Type":  "Toggle",
+                                             "registry":  [
+                                                              {
+                                                                  "Path":  "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                                                                  "Name":  "SystemResponsiveness",
+                                                                  "Value":  "10",
+                                                                  "Type":  "DWord",
+                                                                  "OriginalValue":  "20",
+                                                                  "DefaultState":  "false"
+                                                              },
+                                                              {
+                                                                  "Path":  "HKLM:\\SOFTWARE\\Microsoft\\Windows NT\\CurrentVersion\\Multimedia\\SystemProfile",
+                                                                  "Name":  "NetworkThrottlingIndex",
+                                                                  "Value":  "-1",
+                                                                  "Type":  "DWord",
+                                                                  "OriginalValue":  "10",
+                                                                  "DefaultState":  "false"
+                                                              }
+                                                          ],
+                                             "link":  "https://learn.microsoft.com/en-us/windows/win32/procthread/multimedia-class-scheduler-service"
+                                         },
+    "WPFToggleFastStartup":  {
+                                 "Content":  "Fast Startup",
+                                 "Description":  "Toggles Fast Startup (HiberbootEnabled). Turning it off makes Shut down perform a full shutdown, so drivers and the kernel start clean; boot can take a few seconds longer. Has no effect while hibernation is disabled.",
+                                 "category":  "Customize Preferences",
+                                 "panel":  "2",
+                                 "Type":  "Toggle",
+                                 "registry":  [
+                                                  {
+                                                      "Path":  "HKLM:\\SYSTEM\\CurrentControlSet\\Control\\Session Manager\\Power",
+                                                      "Name":  "HiberbootEnabled",
+                                                      "Value":  "1",
+                                                      "Type":  "DWord",
+                                                      "OriginalValue":  "0",
+                                                      "DefaultState":  "true"
+                                                  }
+                                              ],
+                                 "link":  "https://learn.microsoft.com/en-us/troubleshoot/windows-client/setup-upgrade-and-drivers/fast-startup-causes-hibernation-file-to-be-created"
+                             },
     "WPFToggleLongPaths":  {
                                "Content":  "Enable Long Paths",
                                "Description":  "Toggles support for file paths longer than 260 characters in Explorer.",
@@ -13161,6 +15609,36 @@ $inputXML = @'
                 </Setter.Value>
             </Setter>
         </Style>
+        <!-- Guided mode: large mode cards and the highlighted answer button -->
+        <Style x:Key="GuidedCardButton" TargetType="Button">
+            <Setter Property="Foreground" Value="{DynamicResource MainForegroundColor}" />
+            <Setter Property="Background" Value="{DynamicResource ButtonBackgroundColor}" />
+            <Setter Property="BorderBrush" Value="{DynamicResource BorderColor}" />
+            <Setter Property="HorizontalContentAlignment" Value="Stretch" />
+            <Setter Property="Cursor" Value="Hand" />
+            <Setter Property="Template">
+                <Setter.Value>
+                    <ControlTemplate TargetType="Button">
+                        <Border Name="CardBorder" Background="{TemplateBinding Background}" BorderBrush="{TemplateBinding BorderBrush}" BorderThickness="2" CornerRadius="8" Padding="24">
+                            <ContentPresenter HorizontalAlignment="Stretch" VerticalAlignment="Top" />
+                        </Border>
+                        <ControlTemplate.Triggers>
+                            <Trigger Property="IsMouseOver" Value="True">
+                                <Setter TargetName="CardBorder" Property="BorderBrush" Value="{DynamicResource ToggleButtonOnColor}" />
+                            </Trigger>
+                            <Trigger Property="IsKeyboardFocused" Value="True">
+                                <Setter TargetName="CardBorder" Property="BorderBrush" Value="{DynamicResource ToggleButtonOnColor}" />
+                            </Trigger>
+                        </ControlTemplate.Triggers>
+                    </ControlTemplate>
+                </Setter.Value>
+            </Setter>
+        </Style>
+        <Style x:Key="GuidedPrimaryButton" TargetType="Button" BasedOn="{StaticResource {x:Type Button}}">
+            <Setter Property="Background" Value="{DynamicResource ToggleButtonOnColor}" />
+            <Setter Property="Foreground" Value="White" />
+            <Setter Property="FontWeight" Value="Bold" />
+        </Style>
     </Window.Resources>
     <Grid Background="{DynamicResource MainBackgroundColor}" ShowGridLines="False" Name="WPFMainGrid" Width="Auto" Height="Auto" HorizontalAlignment="Stretch">
         <Grid.RowDefinitions>
@@ -13200,6 +15678,7 @@ $inputXML = @'
                         <TextBlock FontSize="{DynamicResource TabButtonFontSize}" Background="Transparent" Foreground="{DynamicResource ButtonTweaksForegroundColor}"><Underline>A</Underline>dvanced</TextBlock>
                     </ToggleButton.Content>
                 </ToggleButton>
+
 
 
 
@@ -13280,6 +15759,11 @@ $inputXML = @'
                             <MenuItem FontSize="{DynamicResource ButtonFontSize}" Header="Export" Name="ExportMenuItem" Foreground="{DynamicResource MainForegroundColor}">
                                 <MenuItem.ToolTip>
                                     <ToolTip Content="Export Selected Elements and copy execution command to clipboard." />
+                                </MenuItem.ToolTip>
+                            </MenuItem>
+                            <MenuItem FontSize="{DynamicResource ButtonFontSize}" Header="Guided mode" Name="GuidedModeMenuItem" Foreground="{DynamicResource MainForegroundColor}">
+                                <MenuItem.ToolTip>
+                                    <ToolTip Content="Open the guided mode window: one question at a time, then a summary." />
                                 </MenuItem.ToolTip>
                             </MenuItem>
                             <Separator />
@@ -13386,23 +15870,13 @@ $inputXML = @'
                                     </WrapPanel>
                                 </StackPanel>
                             </Border>
-                            <Border Background="{DynamicResource MainBackgroundColor}" BorderBrush="{DynamicResource BorderColor}" BorderThickness="1" CornerRadius="6" Padding="20" Margin="0,18,0,0">
-                                <StackPanel>
-                                    <TextBlock Name="WPFDefenderHeading" Text="Windows Defender" FontSize="20" FontWeight="Bold" Foreground="{DynamicResource MainForegroundColor}" Margin="0,0,0,8" />
-                                    <TextBlock Name="WPFDefenderDescription" Text="Turn real-time protection off or on using Microsoft Defender PowerShell commands. Administrator access is required. Tamper Protection or device policies may block changes, and Windows may turn protection back on automatically. Protected antivirus services are not stopped or removed." TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Margin="0,0,0,12" />
-                                    <TextBlock Name="WPFDefenderRealtimeStatus" Text="Checking Microsoft Defender..." TextWrapping="Wrap" FontWeight="SemiBold" Foreground="{DynamicResource MainForegroundColor}" Margin="0,0,0,14" />
-                                    <WrapPanel>
-                                        <Button Name="WPFDisableDefenderRealtime" Content="Disable protection" IsEnabled="False" MinWidth="190" Height="36" Margin="0,0,10,8" Padding="12,4" />
-                                        <Button Name="WPFEnableDefenderRealtime" Content="Enable protection" IsEnabled="False" MinWidth="190" Height="36" Margin="0,0,0,8" Padding="12,4" />
-                                    </WrapPanel>
-                                </StackPanel>
-                            </Border>
                         </StackPanel>
                     </ScrollViewer>
                 </Grid>
             </TabItem>
 
         </TabControl>
+
 
         <!-- Window-level progress indicator - visible regardless of active tab -->
         <Border Name="WPFTweaksProgressBar" Grid.Row="3" Background="{DynamicResource MainBackgroundColor}" Visibility="Collapsed" Padding="10,6">
@@ -13509,6 +15983,147 @@ $inputXML = @'
                 </Border>
             </Border>
         </Popup>
+    </Grid>
+</Window>
+
+'@
+$guidedXML = @'
+<Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation" xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml" WindowStartupLocation="CenterScreen" UseLayoutRounding="True" WindowStyle="SingleBorderWindow" Width="1060" Height="720" MinWidth="860" MinHeight="600" Title="APBOptimizer" Background="{DynamicResource MainBackgroundColor}">
+    <!-- Separate guided-mode window. Styles and theme colours come from the main window's
+         resources, merged in at runtime, so every style here is a DynamicResource. -->
+    <WindowChrome.WindowChrome>
+        <WindowChrome CaptionHeight="0" CornerRadius="10" UseAeroCaptionButtons="False" />
+    </WindowChrome.WindowChrome>
+    <Grid Name="WPFGuidedRoot" Background="{DynamicResource MainBackgroundColor}">
+        <Grid.RowDefinitions>
+            <RowDefinition Height="Auto" />
+            <RowDefinition Height="*" />
+        </Grid.RowDefinitions>
+
+        <DockPanel Name="WPFGuidedTitleBar" Grid.Row="0" Height="46" Background="{DynamicResource MainBackgroundColor}" LastChildFill="True">
+            <StackPanel Name="GuidedLogoPanel" Orientation="Horizontal" DockPanel.Dock="Left" Margin="14,0,10,0" VerticalAlignment="Center" />
+            <Button Name="WPFGuidedCloseWindow" DockPanel.Dock="Right" Style="{DynamicResource HoverButtonStyle}" BorderThickness="0" BorderBrush="Transparent" Background="{DynamicResource MainBackgroundColor}" Foreground="{DynamicResource MainForegroundColor}" Width="{DynamicResource IconButtonSize}" Height="{DynamicResource IconButtonSize}" Margin="0,0,6,0" FontFamily="Segoe MDL2 Assets" FontSize="{DynamicResource CloseIconFontSize}" Content="&#xE8BB;" ToolTip="Cerrar" AutomationProperties.Name="Cerrar" />
+            <Button Name="WPFGuidedMinimizeWindow" DockPanel.Dock="Right" Style="{DynamicResource HoverButtonStyle}" BorderThickness="0" BorderBrush="Transparent" Background="{DynamicResource MainBackgroundColor}" Foreground="{DynamicResource MainForegroundColor}" Width="{DynamicResource IconButtonSize}" Height="{DynamicResource IconButtonSize}" Margin="0" FontFamily="Segoe MDL2 Assets" FontSize="{DynamicResource CloseIconFontSize}" Content="&#xE921;" ToolTip="Minimizar" AutomationProperties.Name="Minimizar" />
+            <TextBlock Name="WPFGuidedWindowTitle" Text="APBOptimizer" VerticalAlignment="Center" FontFamily="Consolas, Monaco" FontSize="15" FontWeight="Bold" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+        </DockPanel>
+
+        <Grid Grid.Row="1">
+            <ScrollViewer Name="WPFModeChooser" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Visibility="Collapsed">
+                <StackPanel MaxWidth="860" Margin="32,24,32,36" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Name="WPFModeChooserTitle" Text="¿Cómo quieres optimizar Windows?" FontSize="28" FontWeight="Bold" TextAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                    <TextBlock Name="WPFModeChooserSubtitle" Text="El modo guiado te hace una pregunta a la vez. El modo avanzado abre la interfaz completa de APBOptimizer." FontSize="14" TextAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.8" Margin="0,8,0,24" />
+                    <UniformGrid Columns="2">
+                        <Button Name="WPFModeGuided" Style="{DynamicResource GuidedCardButton}" Margin="0,0,10,0" AutomationProperties.Name="Modo guiado">
+                            <StackPanel>
+                                <Border HorizontalAlignment="Left" Background="{DynamicResource ToggleButtonOnColor}" CornerRadius="10" Padding="10,3">
+                                    <TextBlock Name="WPFModeGuidedBadge" Text="Recomendado" FontSize="12" FontWeight="Bold" Foreground="White" Background="Transparent" />
+                                </Border>
+                                <TextBlock Name="WPFModeGuidedTitle" Text="Modo guiado" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Margin="0,14,0,8" />
+                                <TextBlock Name="WPFModeGuidedText" Text="Una pregunta por pantalla, con una explicación de qué cambia. Ves un resumen antes de aplicar nada." FontSize="14" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                                <TextBlock Name="WPFModeGuidedMeta" Text="Unos 3 minutos" FontSize="13" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.75" Margin="0,12,0,0" />
+                            </StackPanel>
+                        </Button>
+                        <Button Name="WPFModeAdvanced" Style="{DynamicResource GuidedCardButton}" Margin="10,0,0,0" AutomationProperties.Name="Modo avanzado">
+                            <StackPanel>
+                                <Border HorizontalAlignment="Left" Background="Transparent" Padding="0,3">
+                                    <TextBlock Text=" " FontSize="12" Background="Transparent" />
+                                </Border>
+                                <TextBlock Name="WPFModeAdvancedTitle" Text="Modo avanzado" FontSize="22" FontWeight="Bold" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Margin="0,14,0,8" />
+                                <TextBlock Name="WPFModeAdvancedText" Text="Abre la interfaz completa con todos los ajustes, servicios, drivers y opciones de Windows Update." FontSize="14" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                                <TextBlock Name="WPFModeAdvancedMeta" Text="Para quienes saben qué tocar" FontSize="13" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.75" Margin="0,12,0,0" />
+                            </StackPanel>
+                        </Button>
+                    </UniformGrid>
+                </StackPanel>
+            </ScrollViewer>
+
+            <Grid Name="WPFGuidedWizard" Margin="40,10,40,16" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <StackPanel Grid.Row="0">
+                    <DockPanel>
+                        <TextBlock Name="WPFGuidedStep" DockPanel.Dock="Right" FontSize="13" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.8" />
+                        <TextBlock Name="WPFGuidedCategory" FontSize="13" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.8" />
+                    </DockPanel>
+                    <ProgressBar Name="WPFGuidedProgress" Height="8" Minimum="0" Maximum="100" Value="0" Margin="0,8,0,0" Style="{DynamicResource RoundedProgressBarStyle}" Foreground="{DynamicResource ToggleButtonOnColor}" />
+                </StackPanel>
+                <ScrollViewer Grid.Row="1" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Margin="0,22,0,12">
+                    <StackPanel MaxWidth="820" HorizontalAlignment="Left">
+                        <WrapPanel Name="WPFGuidedBadges" />
+                        <TextBlock Name="WPFGuidedTitle" FontSize="28" FontWeight="Bold" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Margin="0,12,0,0" />
+                        <TextBlock Name="WPFGuidedBody" FontSize="15" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.9" Margin="0,12,0,0" LineHeight="22" />
+                        <StackPanel Name="WPFGuidedDetails" Margin="0,16,0,0" Visibility="Collapsed">
+                            <TextBlock Name="WPFGuidedDetailsTitle" Text="Qué cambia" FontSize="14" FontWeight="Bold" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Margin="0,0,0,6" />
+                            <StackPanel Name="WPFGuidedDetailsList" />
+                        </StackPanel>
+                        <Border Name="WPFGuidedNote" Background="{DynamicResource TweakHelpSectionColor}" BorderBrush="{DynamicResource TweakHelpBorderColor}" BorderThickness="1" CornerRadius="6" Padding="14,12" Margin="0,16,0,0" Visibility="Collapsed">
+                            <TextBlock Name="WPFGuidedNoteText" FontSize="14" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                        </Border>
+                        <Border Name="WPFGuidedAdvice" BorderThickness="1.5" CornerRadius="6" Padding="14,12" Margin="0,16,0,0" Visibility="Collapsed">
+                            <StackPanel>
+                                <TextBlock Name="WPFGuidedAdviceTitle" FontSize="14" FontWeight="Bold" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                                <TextBlock Name="WPFGuidedAdviceText" FontSize="14" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.9" Margin="0,4,0,0" />
+                            </StackPanel>
+                        </Border>
+                        <TextBlock Name="WPFGuidedState" FontSize="14" FontWeight="SemiBold" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Margin="0,14,0,0" Visibility="Collapsed" />
+                        <StackPanel Name="WPFGuidedOptions" Margin="0,16,0,0" />
+                    </StackPanel>
+                </ScrollViewer>
+                <DockPanel Grid.Row="2" LastChildFill="False">
+                    <Button Name="WPFGuidedBack" DockPanel.Dock="Left" Content="Atrás" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="0" />
+                    <Button Name="WPFGuidedYes" DockPanel.Dock="Right" Content="Sí" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="10,0,0,0" />
+                    <Button Name="WPFGuidedNo" DockPanel.Dock="Right" Content="No" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="0" />
+                </DockPanel>
+            </Grid>
+
+            <Grid Name="WPFGuidedSummary" Margin="40,10,40,16" Visibility="Collapsed">
+                <Grid.RowDefinitions>
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="*" />
+                    <RowDefinition Height="Auto" />
+                    <RowDefinition Height="Auto" />
+                </Grid.RowDefinitions>
+                <StackPanel Grid.Row="0">
+                    <TextBlock Name="WPFGuidedSummaryTitle" FontSize="26" FontWeight="Bold" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                    <TextBlock Name="WPFGuidedSummarySubtitle" FontSize="14" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.8" Margin="0,6,0,0" />
+                </StackPanel>
+                <Border Grid.Row="1" BorderBrush="{DynamicResource BorderColor}" BorderThickness="1" CornerRadius="6" Margin="0,16,0,10">
+                    <ScrollViewer VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                        <StackPanel Name="WPFGuidedSummaryList" />
+                    </ScrollViewer>
+                </Border>
+                <TextBlock Name="WPFGuidedSummaryNote" Grid.Row="2" FontSize="13" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.8" Margin="0,0,0,12" />
+                <DockPanel Grid.Row="3" LastChildFill="False">
+                    <Button Name="WPFGuidedSummaryBack" DockPanel.Dock="Left" Content="Atrás" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="0" />
+                    <Button Name="WPFGuidedApply" DockPanel.Dock="Right" Content="Aplicar" Width="Auto" MinWidth="170" Height="40" FontSize="15" Margin="10,0,0,0" Style="{DynamicResource GuidedPrimaryButton}" />
+                    <Button Name="WPFGuidedReview" DockPanel.Dock="Right" Content="Revisar en modo avanzado" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="0" />
+                </DockPanel>
+            </Grid>
+
+            <ScrollViewer Name="WPFGuidedDone" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled" Visibility="Collapsed">
+                <StackPanel MaxWidth="680" Margin="32,40" HorizontalAlignment="Center" VerticalAlignment="Center">
+                    <TextBlock Name="WPFGuidedDoneTitle" FontSize="28" FontWeight="Bold" TextAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" />
+                    <TextBlock Name="WPFGuidedDoneText" FontSize="15" TextAlignment="Center" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.9" Margin="0,14,0,20" />
+                    <Border Name="WPFGuidedErrors" Background="{DynamicResource TweakHelpSectionColor}" BorderBrush="#E07B24" BorderThickness="1" CornerRadius="6" Padding="14,12" Margin="0,0,0,20" Visibility="Collapsed">
+                        <ScrollViewer MaxHeight="220" VerticalScrollBarVisibility="Auto" HorizontalScrollBarVisibility="Disabled">
+                            <StackPanel Name="WPFGuidedErrorsList" />
+                        </ScrollViewer>
+                    </Border>
+                    <StackPanel Name="WPFGuidedJobPanel" Margin="0,0,0,20">
+                        <TextBlock Name="WPFGuidedJobLabel" FontSize="13" TextWrapping="Wrap" Foreground="{DynamicResource MainForegroundColor}" Background="Transparent" Opacity="0.8" Margin="0,0,0,6" />
+                        <ProgressBar Name="WPFGuidedJobProgress" Height="8" Minimum="0" Maximum="100" Value="0" Style="{DynamicResource RoundedProgressBarStyle}" Foreground="{DynamicResource ToggleButtonOnColor}" />
+                    </StackPanel>
+                    <WrapPanel Name="WPFGuidedDoneButtons" HorizontalAlignment="Center" Visibility="Collapsed">
+                        <Button Name="WPFGuidedDoneAdvanced" Content="Ir al modo avanzado" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="5,0" />
+                        <Button Name="WPFGuidedDoneHome" Content="Volver al inicio" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="5,0" />
+                        <Button Name="WPFGuidedRestart" Content="Reiniciar ahora" Width="Auto" MinWidth="150" Height="40" FontSize="15" Margin="5,0" Style="{DynamicResource GuidedPrimaryButton}" />
+                    </WrapPanel>
+                </StackPanel>
+            </ScrollViewer>
+        </Grid>
     </Grid>
 </Window>
 
